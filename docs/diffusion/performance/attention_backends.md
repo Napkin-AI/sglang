@@ -32,9 +32,9 @@ For SGLang-native pipelines, the CLI accepts the lowercase names of `AttentionBa
 | `aiter` | `AITER` | Requires `aiter`. |
 | `aiter_sage` | `AITER_SAGE` | Requires `aiter`. |
 | `sparse_video_gen_2_attn` | `SPARSE_VIDEO_GEN_2_ATTN` | Requires `svg`. See installation instructions at https://github.com/svg-project/Sparse-VideoGen. |
-| `laser_attn` | `LASER_ATTN` | Requires `attentions` which can be installed with `sgl_kernel_npu`; available only for NPU. doesn`t support cross-attention. |
-| `block_sparse_attn` | `BLOCK_SPARSE_ATTN` | Requires `attentions` which can be installed with `sgl_kernel_npu`; available only for NPU, doesn`t support cross-attention. |
-| `rain_fusion_attn` | `RAIN_FUSION_ATTN` | Requires `attentions` which can be installed with `sgl_kernel_npu`; available only for NPU, doesn`t support cross-attention. |
+| `laser_attn` | `LASER_ATTN` | Requires `attentions` which can be installed with `sgl_kernel_npu`; available only for NPU. |
+| `block_sparse_attn` | `BLOCK_SPARSE_ATTN` | Requires `attentions` which can be installed with `sgl_kernel_npu`; available only for NPU. |
+| `rain_fusion_attn` | `RAIN_FUSION_ATTN` | Requires `attentions` which can be installed with `sgl_kernel_npu`; available only for NPU. |
 
 ## Selection priority
 

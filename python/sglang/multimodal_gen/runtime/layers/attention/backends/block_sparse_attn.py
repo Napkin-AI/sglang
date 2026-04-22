@@ -81,7 +81,10 @@ class BlockSparseAttentionMetadataBuilder(AttentionMetadataBuilder):
 
         if sparsity == 0.0:
             logger.warning(
-                "Sparsity is set to 0.0, which means no tokens will be dropped. For better perfomance use Laser Attention or increase sparsity. "
+                (
+                    "Sparsity is set to 0.0, which means no tokens will be dropped."
+                    "For better perfomance use Laser Attention or increase sparsity."
+                )
             )
 
         if len(raw_latent_shape) >= 5:
@@ -238,14 +241,14 @@ class BlockSparseAttentionImpl(AttentionImpl):
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
         if attn_metadata.current_timestep < attn_metadata.skip_first_steps:
-            attention_out = self.laser_attn_impl.forward(
+            output = self.laser_attn_impl.forward(
                 query,
                 key,
                 value,
                 attn_metadata,
             )
         else:
-            attention_out = self._adaptive_block_sparse_attention(
+            output = self._adaptive_block_sparse_attention(
                 query,
                 key,
                 value,
@@ -253,4 +256,4 @@ class BlockSparseAttentionImpl(AttentionImpl):
                 attn_metadata.sparsity,
             )
 
-        return attention_out
+        return output

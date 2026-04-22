@@ -84,7 +84,10 @@ class RainFusionAttentionMetadataBuilder(AttentionMetadataBuilder):
 
         if sparsity == 0.0:
             logger.warning(
-                "Sparsity is set to 0.0, which means no tokens will be dropped. For better perfomance use Laser Attention or increase sparsity. "
+                (
+                    "Sparsity is set to 0.0, which means no tokens will be dropped."
+                    "For better perfomance use Laser Attention or increase sparsity."
+                )
             )
 
         latent_shape = raw_latent_shape[-3:]
@@ -452,18 +455,18 @@ class RainFusionAttentionImpl(AttentionImpl):
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
         if attn_metadata.current_timestep < attn_metadata.skip_first_steps:
-            attention_out = self.laser_attn_impl.forward(
+            output = self.laser_attn_impl.forward(
                 query,
                 key,
                 value,
                 attn_metadata,
             )
         else:
-            attention_out = self._rain_fusion_sparse_attention(
+            output = self._rain_fusion_sparse_attention(
                 query,
                 key,
                 value,
                 attn_metadata.latent_shape,
                 attn_metadata.sparsity,
             )
-        return attention_out
+        return output
