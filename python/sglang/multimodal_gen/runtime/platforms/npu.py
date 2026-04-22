@@ -122,7 +122,7 @@ class NPUPlatformBase(Platform):
 
         elif selected_backend == AttentionBackendEnum.LASER_ATTN:
             try:
-                from sglang.multimodal_gen.runtime.layers.attention.backends.laser_attn import (
+                from sglang.multimodal_gen.runtime.layers.attention.backends.laser_attn import (  # noqa: F401
                     LaserAttentionBackend,
                 )
 
@@ -135,7 +135,7 @@ class NPUPlatformBase(Platform):
 
         elif selected_backend == AttentionBackendEnum.BLOCK_SPARSE_ATTN:
             try:
-                from sglang.multimodal_gen.runtime.layers.attention.backends.block_sparse_attn import (
+                from sglang.multimodal_gen.runtime.layers.attention.backends.block_sparse_attn import (  # noqa: F401
                     BlockSparseAttentionBackend,
                 )
 
@@ -152,7 +152,7 @@ class NPUPlatformBase(Platform):
 
         elif selected_backend == AttentionBackendEnum.RAIN_FUSION_ATTN:
             try:
-                from sglang.multimodal_gen.runtime.layers.attention.backends.rain_fusion_attn import (
+                from sglang.multimodal_gen.runtime.layers.attention.backends.rain_fusion_attn import (  # noqa: F401
                     RainFusionAttentionBackend,
                 )
 

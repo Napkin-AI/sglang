@@ -1,6 +1,7 @@
 from dataclasses import dataclass
-from typing import Optional, Any
+from typing import Any
 
+import attentions  # noqa: F401
 import torch
 
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
@@ -9,13 +10,11 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionMetadata,
     AttentionMetadataBuilder,
 )
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.layers.attention.backends.laser_attn import (
     LaserAttentionBackend,
 )
-
-import attentions
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 BSA_BLOCK_SIZE = 128

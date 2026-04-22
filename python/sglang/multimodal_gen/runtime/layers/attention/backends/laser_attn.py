@@ -1,6 +1,3 @@
-from dataclasses import dataclass
-from typing import Any
-
 import torch
 
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
@@ -14,7 +11,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 # Import to use torch.ops.attentions, install package with sgl_kernel_npu
 try:
-    import attentions
+    import attentions  # noqa: F401
 except ImportError as e:
     raise ImportError(
         (
