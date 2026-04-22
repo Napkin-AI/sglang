@@ -120,6 +120,53 @@ class NPUPlatformBase(Platform):
             logger.info("Using Ascend Flash Attention backend.")
             return "sglang.multimodal_gen.runtime.layers.attention.backends.ascend_fa.AscendFABackend"
 
+        elif selected_backend == AttentionBackendEnum.LASER_ATTN:
+            try:
+                from sglang.multimodal_gen.runtime.layers.attention.backends.laser_attn import (
+                    LaserAttentionBackend,
+                )
+
+                logger.info("Using Laser Attention backend")
+
+                return "sglang.multimodal_gen.runtime.layers.attention.backends.laser_attn.LaserAttentionBackend"
+            except ImportError as e:
+                logger.error("Failed to import Laser Attention backend: %s", str(e))
+                raise ImportError("Laser Attention backend is not installed.") from e
+
+        elif selected_backend == AttentionBackendEnum.BLOCK_SPARSE_ATTN:
+            try:
+                from sglang.multimodal_gen.runtime.layers.attention.backends.block_sparse_attn import (
+                    BlockSparseAttentionBackend,
+                )
+
+                logger.info("Using Block Sparse Attention backend")
+
+                return "sglang.multimodal_gen.runtime.layers.attention.backends.block_sparse_attn.BlockSparseAttentionBackend"
+            except ImportError as e:
+                logger.error(
+                    "Failed to import Block Sparse Attention backend: %s", str(e)
+                )
+                raise ImportError(
+                    "Block Sparse Attention backend is not installed."
+                ) from e
+
+        elif selected_backend == AttentionBackendEnum.RAIN_FUSION_ATTN:
+            try:
+                from sglang.multimodal_gen.runtime.layers.attention.backends.rain_fusion_attn import (
+                    RainFusionAttentionBackend,
+                )
+
+                logger.info("Using Rain Fusion Attention backend")
+
+                return "sglang.multimodal_gen.runtime.layers.attention.backends.rain_fusion_attn.RainFusionAttentionBackend"
+            except ImportError as e:
+                logger.error(
+                    "Failed to import Rain Fusion Attention backend: %s", str(e)
+                )
+                raise ImportError(
+                    " Rain Fusion Attention backend is not installed."
+                ) from e
+
         logger.info("Using Torch SDPA backend.")
         return (
             "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
