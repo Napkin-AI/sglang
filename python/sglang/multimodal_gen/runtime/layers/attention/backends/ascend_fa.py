@@ -67,8 +67,6 @@ class AscendFAImpl(AttentionImpl):
     ) -> None:
         self.causal = causal
         self.softmax_scale = softmax_scale
-        self.num_heads = num_heads
-        self.num_kv_heads = num_kv_heads or num_heads
 
     def forward(
         self,
@@ -92,8 +90,8 @@ class AscendFAImpl(AttentionImpl):
             query,
             key,
             value,
-            num_heads=self.num_heads,
-            num_key_value_heads=self.num_kv_heads,
+            num_heads=query.shape[1],
+            num_key_value_heads=key.shape[1],
             scale=self.softmax_scale,
             input_layout="BNSD",
             softmax_lse_flag=return_softmax_lse,
