@@ -96,6 +96,15 @@ _is_cuda = is_cuda()
 _is_npu = is_npu()
 
 
+if _is_npu:
+    split_qkv_rmsnorm_rope_pos_cache_half_npu = None
+    try:
+        from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope_pos_cache_half_npu import (
+            split_qkv_rmsnorm_rope_pos_cache_half_npu,
+        )
+    except (ImportError, OSError):
+        pass
+
 class LLaDA2MoeMLP(nn.Module):
     def __init__(
         self,
@@ -340,10 +349,12 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
             shared_output = self.shared_experts(hidden_states)
         return shared_output
 
-    def _forward_router_experts(self, hidden_states: torch.Tensor):
+    def _forward_router_experts(self, hidden_states: torch.Tensor, shared_output: Optional[torch.Tensor] = None,):
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
+        if _is_npu:
+            return self.experts(hidden_states, topk_output, shared_output)
         return self.experts(hidden_states, topk_output)
 
     def forward_normal_dual_stream(
@@ -378,9 +389,12 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
             )
         else:
             shared_output = self._forward_shared_experts(hidden_states)
-            final_hidden_states = self._forward_router_experts(hidden_states)
+            if _is_npu:
+                final_hidden_states = self._forward_router_experts(hidden_states, shared_output)
+            else:
+                final_hidden_states = self._forward_router_experts(hidden_states)
 
-        if self.num_shared_experts > 0:
+        if not _is_npu and self.num_shared_experts > 0:
             final_hidden_states = final_hidden_states + shared_output
 
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
@@ -524,34 +538,57 @@ class LLaDA2MoeAttention(nn.Module):
         if hidden_states.shape[0] == 0:
             return hidden_states
         qkv, _ = self.query_key_value(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        if self.use_qk_norm:
-            q, k = apply_qk_norm(
-                q=q,
-                k=k,
-                q_norm=self.query_layernorm,
-                k_norm=self.key_layernorm,
-                head_dim=self.head_dim,
-                alt_stream=self.alt_stream,
+
+        if _is_npu and False:
+            q, k, v = split_qkv_rmsnorm_rope_pos_cache_half_npu(
+                qkv,
+                positions,
+                self.rotary_emb.cos_sin_cache,
+                self.q_size,
+                self.kv_size,
+                self.head_dim,
+                eps=self.query_layernorm.variance_epsilon if self.use_qk_norm else None,
+                q_weight=self.query_layernorm.weight if self.use_qk_norm else None,
+                k_weight=self.key_layernorm.weight if self.use_qk_norm else None,
+                q_bias=(
+                    getattr(self.query_layernorm, "bias", None)
+                    if self.use_qk_norm
+                    else None
+                ),
+                k_bias=(
+                    getattr(self.key_layernorm, "bias", None)
+                    if self.use_qk_norm
+                    else None
+                ),
+                rope_dim=self.rotary_dim,
             )
-        can_fuse_set_kv = (
-            self.head_dim == self.rotary_emb.rotary_dim
-            and enable_fused_set_kv_buffer(forward_batch)
-        )
-        q, k = self.rotary_emb(
-            positions,
-            q,
-            k,
-            fused_set_kv_buffer_arg=(
-                create_fused_set_kv_buffer_arg(
-                    value=v,
-                    layer=self.attn,
-                    forward_batch=forward_batch,
+            can_fuse_set_kv = False
+        else:
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            if self.use_qk_norm:
+                q, k = apply_qk_norm(
+                    q=q,
+                    k=k,
+                    q_norm=self.query_layernorm,
+                    k_norm=self.key_layernorm,
+                    head_dim=self.head_dim,
+                    alt_stream=self.alt_stream,
                 )
-                if can_fuse_set_kv
-                else None
-            ),
-        )
+            can_fuse_set_kv = enable_fused_set_kv_buffer(forward_batch)
+            q, k = self.rotary_emb(
+                positions,
+                q,
+                k,
+                fused_set_kv_buffer_arg=(
+                    create_fused_set_kv_buffer_arg(
+                        value=v,
+                        layer=self.attn,
+                        forward_batch=forward_batch,
+                    )
+                    if can_fuse_set_kv
+                    else None
+                ),
+            )
         context_layer = self.attn(
             q,
             k,

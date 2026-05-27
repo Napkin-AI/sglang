@@ -117,9 +117,9 @@ def write_cache_indices(
     if support_triton(get_global_server_args().attention_backend):
         prefix_pointers = torch.tensor(
             [t.data_ptr() for t in prefix_tensors],
-            device=req_to_token_pool.device,
             dtype=torch.uint64,
-        )
+            pin_memory=True,
+        ).to(req_to_token_pool.device, non_blocking=True)
         # TODO: some tensors can be reused for ForwardBatchInfo (e.g., extend_lens, cumsum_start)
         write_req_to_token_pool_triton[(req_pool_indices_tensor.shape[0],)](
             req_to_token_pool.req_to_token,
@@ -443,8 +443,8 @@ def alloc_for_extend(
     prefix_tensors = [r.prefix_indices for r in batch.reqs]
 
     # Create tensors for allocation
-    prefix_lens_cpu = torch.tensor(batch.prefix_lens, dtype=torch.int64)
-    extend_lens_cpu = torch.tensor(batch.extend_lens, dtype=torch.int64)
+    prefix_lens_cpu = torch.tensor(batch.prefix_lens, dtype=torch.int64, pin_memory=True)
+    extend_lens_cpu = torch.tensor(batch.extend_lens, dtype=torch.int64, pin_memory=True)
     prefix_lens_device = prefix_lens_cpu.to(batch.device, non_blocking=True)
     extend_lens_device = extend_lens_cpu.to(batch.device, non_blocking=True)
 
@@ -452,7 +452,7 @@ def alloc_for_extend(
     req_pool_indices = alloc_req_slots(
         batch.req_to_token_pool, batch.reqs, batch.tree_cache
     )
-    req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
+    req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64, pin_memory=True)
     req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
 
     # Allocate KV cache (throws exception on failure)

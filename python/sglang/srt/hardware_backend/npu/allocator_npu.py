@@ -22,6 +22,7 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         kvcache: "KVCache",
         need_sort: bool,
     ):
+        # page_size = 32
         super().__init__(size, page_size, dtype, device, kvcache, need_sort)
         self.roundup = page_size - 1
 
@@ -42,15 +43,17 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
 
         if num_new_pages is None:
             num_new_pages_tensor = (
-                (seq_lens + self.roundup) // self.page_size
-                - (prefix_lens + self.roundup) // self.page_size
+                (seq_lens_cpu + self.roundup) // self.page_size
+                - (prefix_lens_cpu + self.roundup) // self.page_size
             ).sum()
             num_new_pages_item = num_new_pages_tensor.item()
         else:
             num_new_pages_item = num_new_pages
+
         if self.need_sort and num_new_pages_item > len(self.free_pages):
             self.merge_and_sort_free()
 
+        #print(f"alloc_extend SECOND: {num_new_pages_item=}, {self.roundup=} {self.page_size=} {num_new_pages=} {seq_lens=} {prefix_lens=} {seq_lens_cpu=} {prefix_lens_cpu=}")
         if num_new_pages_item > len(self.free_pages):
             return None
 
