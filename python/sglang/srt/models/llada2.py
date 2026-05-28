@@ -539,7 +539,7 @@ class LLaDA2MoeAttention(nn.Module):
             return hidden_states
         qkv, _ = self.query_key_value(hidden_states)
 
-        if _is_npu and False:
+        if _is_npu:
             q, k, v = split_qkv_rmsnorm_rope_pos_cache_half_npu(
                 qkv,
                 positions,
@@ -817,7 +817,9 @@ class LLaDA2MoeModelLM(nn.Module):
         self.pp_group = get_pp_group()
         self.config = config
         self.quant_config = quant_config
+
         alt_stream = torch.cuda.Stream() if _is_cuda else None
+
 
         self.model = LLaDA2MoeModel(
             config,

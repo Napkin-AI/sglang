@@ -607,6 +607,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     for i in range(block_offset, block_offset + block_size)
                 ],
                 dtype=positions_dtype,
+                pin_memory=True,
             ).to(device, non_blocking=True)
         elif (
             ret.spec_info is not None
@@ -621,11 +622,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         else:
             assert isinstance(extend_seq_lens, list)
             assert isinstance(extend_prefix_lens, list)
-            ret.extend_seq_lens = torch.tensor(extend_seq_lens, dtype=torch.int32).to(
+            ret.extend_seq_lens = torch.tensor(extend_seq_lens, dtype=torch.int32, pin_memory=True).to(
                 device, non_blocking=True
             )
             ret.extend_prefix_lens = torch.tensor(
-                extend_prefix_lens, dtype=torch.int32
+                extend_prefix_lens, dtype=torch.int32, pin_memory=True
             ).to(device, non_blocking=True)
             ret.extend_num_tokens = batch.extend_num_tokens
             positions, ret.extend_start_loc = compute_position(
@@ -1203,10 +1204,10 @@ def compute_position_triton(
     has_prefix = extend_prefix_lens.shape[0] == batch_size
 
     positions = torch.empty(
-        extend_seq_lens_sum, dtype=torch.int64, device=extend_seq_lens.device
+        extend_seq_lens_sum, dtype=torch.int64, pin_memory=True).to(extend_seq_lens.device, non_blocking=True
     )
     extend_start_loc = torch.empty(
-        batch_size, dtype=torch.int32, device=extend_seq_lens.device
+        batch_size, dtype=torch.int32, pin_memory=True).to(extend_seq_lens.device, non_blocking=True
     )
 
     # Launch kernel
