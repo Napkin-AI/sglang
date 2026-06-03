@@ -102,6 +102,7 @@ class ForwardMode(IntEnum):
 
     # Used in dLLM
     DLLM_EXTEND = auto()
+    DLLM_DECODE = auto()
 
     def is_prefill(self, include_draft_extend_v2: bool = False):
         return self.is_extend(include_draft_extend_v2=include_draft_extend_v2)
@@ -114,7 +115,7 @@ class ForwardMode(IntEnum):
             or (include_draft_extend_v2 and self == ForwardMode.DRAFT_EXTEND_V2)
             or self == ForwardMode.TARGET_VERIFY
             or self == ForwardMode.SPLIT_PREFILL
-            or self == ForwardMode.DLLM_EXTEND
+            or self.is_dllm_extend()
         )
 
     def is_context_parallel_extend(self, include_draft_extend_v2: bool = False):
@@ -166,7 +167,7 @@ class ForwardMode(IntEnum):
             self == ForwardMode.DECODE
             or self == ForwardMode.TARGET_VERIFY
             or self == ForwardMode.IDLE
-            or self == ForwardMode.DLLM_EXTEND
+            or self.is_dllm_extend()
         )
 
     def is_cpu_graph(self):
@@ -186,7 +187,10 @@ class ForwardMode(IntEnum):
         return self == ForwardMode.PREBUILT
 
     def is_dllm_extend(self):
-        return self == ForwardMode.DLLM_EXTEND
+        return (
+            self == ForwardMode.DLLM_EXTEND
+            or self == ForwardMode.DLLM_DECODE
+        )
 
 
 @total_ordering

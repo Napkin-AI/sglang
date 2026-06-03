@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from sglang.srt.dllm.algorithm.base import DllmAlgorithm
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 
 
@@ -124,13 +124,12 @@ class JointThreshold(DllmAlgorithm):
         model_runner: ModelRunner,
         forward_batch: ForwardBatch,
     ) -> tuple[LogitsProcessorOutput | torch.Tensor, torch.Tensor | None, bool]:
-        batch_size = forward_batch.batch_size
-        device = forward_batch.input_ids.device
-
-        mask_index = forward_batch.input_ids == self.mask_id
-        if not mask_index.any():
+        if forward_batch.forward_mode == ForwardMode.DLLM_EXTEND:
             out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
             return out.logits_output, [], out.can_run_graph
+
+        batch_size = forward_batch.batch_size
+        device = forward_batch.input_ids.device
 
         # ---------- build prompt_masks ----------
         if not self.vectorized_decoding:

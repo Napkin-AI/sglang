@@ -332,11 +332,21 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
 
         if _is_npu:
             for weight_name in ["w13_weight", "w2_weight"]:
-                weight = getattr(layer, weight_name)
-                origin_weight = weight.data.transpose(1, 2)
-                new_weight = origin_weight.contiguous()
-                origin_weight.untyped_storage().resize_(0)
-                weight.data = npu_format_cast(new_weight)
+                # weight = getattr(layer, weight_name)
+                # origin_weight = weight.data.transpose(1, 2)
+                # new_weight = origin_weight.contiguous()
+                # origin_weight.untyped_storage().resize_(0)
+                # weight.data = npu_format_cast(new_weight)
+
+                weight_fp = getattr(layer, weight_name)
+                qw, weight_scale = torch.ops.npu.npu_dynamic_quant(weight_fp)
+                qwnz = npu_format_cast(qw.transpose(-2, -1))
+                setattr(layer, weight_name, torch.nn.Parameter(qwnz, requires_grad=False))
+                layer.register_parameter(
+                    f"{weight_name}_scale",
+                    torch.nn.Parameter(weight_scale, requires_grad=False)
+                )
+                torch.npu.empty_cache()
 
         return
 
@@ -662,7 +672,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         num_experts = layer.num_experts
         top_k = layer.top_k or topk_ids.shape[1]  # in case layer.top_k is not set
 
-        hidden_states, expanded_row_idx, expert_tokens, _ = (
+        hidden_states, expanded_row_idx, expert_tokens, pertoken_scale = (
             torch.ops.npu.npu_moe_init_routing_v2(
                 x,
                 topk_ids,
@@ -671,47 +681,61 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 expert_tokens_num_type=1,
                 expert_tokens_num_flag=True,
                 active_expert_range=[0, num_experts],
-                quant_mode=-1,
+                quant_mode=1,
             )
         )
-        expert_tokens = expert_tokens.to(torch.int64)
-        w13_bias = [layer.w13_weight_bias] if self.with_bias else None
-        w2_bias = [layer.w2_weight_bias] if self.with_bias else None
+        # expert_tokens = expert_tokens.to(torch.int64)
+        # w13_bias = [layer.w13_weight_bias] if self.with_bias else None
+        # w2_bias = [layer.w2_weight_bias] if self.with_bias else None
 
+        scale_args13 = {
+            "scale": [layer.w13_weight_scale],
+            "per_token_scale": [pertoken_scale],
+        }
         # gmm1: gate_up_proj
         hidden_states = torch.ops.npu.npu_grouped_matmul(
             x=[hidden_states],
             weight=[layer.w13_weight],
-            bias=w13_bias,
+            # bias=w13_bias,
             split_item=2,
             group_list_type=1,
             group_type=0,
             group_list=expert_tokens,
-            output_dtype=original_dtype,
+            output_dtype=torch.float16,
+            **scale_args13,
         )[0]
 
-        # act_fn:
-        if self.moe_runner_config.activation == "npu_swiglu_oai":
-            from sgl_kernel_npu.activation.swiglu_oai import swiglu_oai
+        hidden_states, swiglu_out_scale = torch.ops.npu.npu_dequant_swiglu_quant(
+            hidden_states, quant_mode=1, activate_left=True
+        )
 
-            hidden_states = swiglu_oai(layer, hidden_states)
-        elif self.moe_runner_config.activation == "silu":
-            hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
-        else:
-            from sglang.srt.layers.activation import GeluAndMul
+        # # act_fn:
+        # if self.moe_runner_config.activation == "npu_swiglu_oai":
+        #     from sgl_kernel_npu.activation.swiglu_oai import swiglu_oai
 
-            hidden_states = GeluAndMul()(hidden_states)
+        #     hidden_states = swiglu_oai(layer, hidden_states)
+        # elif self.moe_runner_config.activation == "silu":
+        #     hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
+        # else:
+        #     from sglang.srt.layers.activation import GeluAndMul
+
+        #     hidden_states = GeluAndMul()(hidden_states)
+
+        scale_args2 = {
+            "scale": [layer.w2_weight_scale],
+            "per_token_scale": [swiglu_out_scale],
+        }
 
         # gmm2: down_proj
         hidden_states = torch.ops.npu.npu_grouped_matmul(
             x=[hidden_states],
             weight=[layer.w2_weight],
-            bias=w2_bias,
+            **scale_args2,
             split_item=2,
             group_list_type=1,
             group_type=0,
             group_list=expert_tokens,
-            output_dtype=original_dtype,
+            output_dtype=torch.float16,
         )[0]
 
         final_hidden_states = torch.ops.npu.npu_moe_finalize_routing(

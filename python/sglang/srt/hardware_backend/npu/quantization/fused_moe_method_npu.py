@@ -242,7 +242,7 @@ def npu_fused_experts_w8a8_decode(
         split_item=2,
         group_type=0,
         group_list_type=group_list_type,
-        output_dtype=torch.bfloat16,
+        output_dtype=torch.float16,
     )[0]
 
     # act_fn: swiglu
@@ -259,7 +259,7 @@ def npu_fused_experts_w8a8_decode(
         split_item=2,
         group_type=0,
         group_list_type=group_list_type,
-        output_dtype=torch.bfloat16,
+        output_dtype=torch.float16,
     )[0]
 
     assert original_shape is not None
