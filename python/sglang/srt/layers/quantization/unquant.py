@@ -752,16 +752,16 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         # if self.moe_runner_config.activation == "npu_swiglu_oai":
         #     from sgl_kernel_npu.activation.swiglu_oai import swiglu_oai
 
-            hidden_states = swiglu_oai(layer, hidden_states)
-        elif self.moe_runner_config.activation == "silu":
-            if self.moe_runner_config.gemm1_clamp_limit is not None:
-                hidden_states = swiglustep_and_mul(
-                    hidden_states, self.moe_runner_config.gemm1_clamp_limit
-                )
-            else:
-                hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
-        else:
-            from sglang.srt.layers.activation import GeluAndMul
+        # hidden_states = swiglu_oai(layer, hidden_states)
+        # elif self.moe_runner_config.activation == "silu":
+        #     if self.moe_runner_config.gemm1_clamp_limit is not None:
+        #         hidden_states = swiglustep_and_mul(
+        #             hidden_states, self.moe_runner_config.gemm1_clamp_limit
+        #         )
+        #     else:
+        #         hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
+        # else:
+        #     from sglang.srt.layers.activation import GeluAndMul
 
         #     hidden_states = GeluAndMul()(hidden_states)
 

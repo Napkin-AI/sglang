@@ -4,18 +4,27 @@ import triton.language as tl
 
 
 def compute_position_triton(
-    extend_prefix_lens: torch.Tensor, extend_seq_lens: torch.Tensor, extend_seq_lens_sum
+    extend_prefix_lens: torch.Tensor, extend_seq_lens: torch.Tensor, extend_seq_lens_sum, is_npu_dllm: bool = False
 ):
     """Compute positions. It is a fused version of `compute_position_torch`."""
     batch_size = extend_seq_lens.shape[0]
     has_prefix = extend_prefix_lens.shape[0] == batch_size
 
-    positions = torch.empty(
-        extend_seq_lens_sum, dtype=torch.int64, device=extend_seq_lens.device
-    )
-    extend_start_loc = torch.empty(
-        batch_size, dtype=torch.int32, device=extend_seq_lens.device
-    )
+    if is_npu_dllm:
+        positions = torch.empty(
+        extend_seq_lens_sum, dtype=torch.int64, pin_memory=True).to(
+            extend_seq_lens.device, non_blocking=True)
+
+        extend_start_loc = torch.empty(
+            batch_size, dtype=torch.int32, pin_memory=True).to(
+                extend_seq_lens.device, non_blocking=True)
+    else:
+        positions = torch.empty(
+            extend_seq_lens_sum, dtype=torch.int64, device=extend_seq_lens.device,
+        )
+        extend_start_loc = torch.empty(
+            batch_size, dtype=torch.int32, device=extend_seq_lens.device
+        )
 
     # Launch kernel
     compute_position_kernel[(batch_size,)](
