@@ -41,6 +41,7 @@ from sglang.srt.speculative.eagle_info import (
     EagleVerifyOutput,
 )
 from sglang.srt.speculative.eagle_utils import (
+    apply_eagle_prefill_input_rotation,
     build_tree_kernel_efficient,
     organize_draft_results,
 )
@@ -53,10 +54,10 @@ from sglang.srt.speculative.spec_utils import (
     fast_topk,
     generate_token_bitmask,
     load_token_map,
-    maybe_detect_nan,
     select_top_k_tokens,
 )
 from sglang.srt.utils import empty_context, get_available_gpu_memory, is_cuda, is_npu
+from sglang.srt.utils.async_probe import maybe_detect_nan
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -88,6 +89,11 @@ class MultiLayerEagleWorker(TpModelWorker):
         self.topk = server_args.speculative_eagle_topk
         self.speculative_num_steps = server_args.speculative_num_steps
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
+        assert self.speculative_num_draft_tokens == self.speculative_num_steps + 1, (
+            "multi-layer EAGLE requires speculative_num_draft_tokens == "
+            "speculative_num_steps + 1, "
+            f"got {self.speculative_num_draft_tokens} and {self.speculative_num_steps}"
+        )
         self.gpu_id = gpu_id
         self.device = server_args.device
         self.target_worker = target_worker
@@ -651,7 +657,7 @@ class MultiLayerEagleWorker(TpModelWorker):
             num_tokens_for_logprob_per_req=1,
         )
         batch.return_hidden_states = False
-        batch.spec_info.prepare_for_extend(batch)
+        apply_eagle_prefill_input_rotation(batch, next_token_ids)
         capture_mode = (
             CaptureHiddenMode.NULL
             if self.speculative_algorithm.is_standalone()
@@ -763,10 +769,12 @@ class MultiLayerEagleWorker(TpModelWorker):
                     self.mtp_model_runner(step).attn_backend.init_forward_metadata(
                         forward_batch
                     )
+                    # Planned pre-pad; do NOT opt into post-pad re-plan — a
+                    # DP-padded re-plan breaks DSA's indexer schedule_meta
+                    # (see #27091). Use the marked pre-pad metadata as-is.
+                    forward_batch.mark_forward_metadata_ready()
                 logits_output = (
-                    self.mtp_model_runner(step)
-                    .forward(forward_batch, skip_attn_backend_init=True)
-                    .logits_output
+                    self.mtp_model_runner(step).forward(forward_batch).logits_output
                 )
 
             maybe_detect_nan(
