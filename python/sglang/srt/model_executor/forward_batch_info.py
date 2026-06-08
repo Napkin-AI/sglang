@@ -727,6 +727,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             return ret
 
         # Override the positions with diffusion LLM or spec_info
+
         if batch.dllm_config is not None:
             block_size = batch.dllm_config.block_size
             # Use int64 for AMD rotary embedding kernel compatibility
@@ -738,6 +739,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     for i in range(block_offset, block_offset + block_size)
                 ],
                 dtype=positions_dtype,
+                pin_memory=_is_npu
             ).to(device, non_blocking=True)
         elif (
             ret.spec_info is not None
@@ -753,11 +755,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             if isinstance(extend_seq_lens, list):
                 # Main path: H2D from host lists; populate *_cpu mirrors.
                 assert isinstance(extend_prefix_lens, list)
+                is_npu_dllm = batch.is_dllm() and _is_npu
                 ret.extend_seq_lens = torch.tensor(
-                    extend_seq_lens, dtype=torch.int32
+                    extend_seq_lens, dtype=torch.int32, pin_memory=is_npu_dllm
                 ).to(device, non_blocking=True)
                 ret.extend_prefix_lens = torch.tensor(
-                    extend_prefix_lens, dtype=torch.int32
+                    extend_prefix_lens, dtype=torch.int32, pin_memory=is_npu_dllm
                 ).to(device, non_blocking=True)
                 ret.extend_prefix_lens_cpu = extend_prefix_lens
                 ret.extend_seq_lens_cpu = extend_seq_lens
@@ -1409,12 +1412,14 @@ def compute_position(
     extend_prefix_lens: torch.Tensor,
     extend_seq_lens: torch.Tensor,
     extend_seq_lens_sum: int,
+    is_npu_dllm: bool = False
 ):
     if support_triton(attn_backend):
         positions, extend_start_loc = compute_position_triton(
             extend_prefix_lens,
             extend_seq_lens,
             extend_seq_lens_sum,
+            is_npu_dllm=is_npu_dllm,
         )
     else:
         positions, extend_start_loc = compute_position_torch(

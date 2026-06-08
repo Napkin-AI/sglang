@@ -21,10 +21,11 @@ from sglang.srt.mem_cache.triton_ops.common import (
     write_req_to_token_pool_triton,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import is_hip, support_triton
+from sglang.srt.utils import is_npu, is_hip, support_triton
 from sglang.srt.utils.common import ceil_align
 
 _is_hip = is_hip()
+_is_npu = is_npu()
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
@@ -73,13 +74,21 @@ def write_cache_indices(
     extend_lens_cpu: torch.Tensor,
     prefix_tensors: list[torch.Tensor],
     req_to_token_pool: ReqToTokenPool,
+    is_npu_dllm: bool = False,
 ):
     if support_triton(get_global_server_args().attention_backend):
-        prefix_pointers = torch.tensor(
-            [t.data_ptr() for t in prefix_tensors],
-            device=req_to_token_pool.device,
-            dtype=torch.uint64,
-        )
+        if is_npu_dllm:
+            prefix_pointers = torch.tensor(
+                [t.data_ptr() for t in prefix_tensors],
+                dtype=torch.uint64,
+                pin_memory=True,
+            ).to(req_to_token_pool.device, non_blocking=True)
+        else:
+            prefix_pointers = torch.tensor(
+                [t.data_ptr() for t in prefix_tensors],
+                device=req_to_token_pool.device,
+                dtype=torch.uint64,
+            )
         # TODO: some tensors can be reused for ForwardBatchInfo (e.g., extend_lens, cumsum_start)
         write_req_to_token_pool_triton[(req_pool_indices_tensor.shape[0],)](
             req_to_token_pool.req_to_token,
@@ -215,6 +224,7 @@ def alloc_paged_token_slots_extend(
     last_loc: torch.Tensor,
     extend_num_tokens: int,
     backup_state: bool = False,
+    is_npu_dllm: bool = False,
 ):
     # Over estimate the number of tokens: assume each request needs a new page.
     allocator = tree_cache.token_to_kv_pool_allocator
@@ -232,6 +242,7 @@ def alloc_paged_token_slots_extend(
         seq_lens_cpu,
         last_loc,
         extend_num_tokens,
+        use_cpu_lens=is_npu_dllm,
     )
 
     if out_cache_loc is None:
@@ -299,8 +310,9 @@ def alloc_for_extend(
     prefix_tensors = [r.prefix_indices for r in batch.reqs]
 
     # Create tensors for allocation
-    prefix_lens_cpu = torch.tensor(batch.prefix_lens, dtype=torch.int64)
-    extend_lens_cpu = torch.tensor(batch.extend_lens, dtype=torch.int64)
+    is_npu_dllm = batch.is_dllm() and _is_npu
+    prefix_lens_cpu = torch.tensor(batch.prefix_lens, dtype=torch.int64, pin_memory=is_npu_dllm)
+    extend_lens_cpu = torch.tensor(batch.extend_lens, dtype=torch.int64, pin_memory=is_npu_dllm)
     prefix_lens_device = prefix_lens_cpu.to(batch.device, non_blocking=True)
     extend_lens_device = extend_lens_cpu.to(batch.device, non_blocking=True)
 
@@ -308,7 +320,7 @@ def alloc_for_extend(
     req_pool_indices = alloc_req_slots(
         batch.req_to_token_pool, batch.reqs, batch.tree_cache
     )
-    req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
+    req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64, pin_memory=is_npu_dllm)
     req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
 
     # Allocate KV cache (throws exception on failure)
@@ -328,6 +340,7 @@ def alloc_for_extend(
             seq_lens_cpu=batch.seq_lens_cpu,
             last_loc=torch.cat(last_loc),
             extend_num_tokens=batch.extend_num_tokens,
+            is_npu_dllm=is_npu_dllm
         )
 
     # Write to req_to_token_pool
@@ -343,6 +356,7 @@ def alloc_for_extend(
         extend_lens_cpu,
         prefix_tensors,
         batch.req_to_token_pool,
+        is_npu_dllm
     )
 
     return out_cache_loc, req_pool_indices_device, req_pool_indices_cpu

@@ -11,13 +11,14 @@ from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
 from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils import is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
 
 
 logger = logging.getLogger(__name__)
-
+_is_npu = is_npu()
 
 @dataclasses.dataclass
 class SamplingBatchInfo:
@@ -79,20 +80,37 @@ class SamplingBatchInfo:
 
         reqs = batch.reqs
         device = batch.device
-        temperatures = torch.tensor(
-            [r.sampling_params.temperature for r in reqs],
-            dtype=torch.float,
-            device=device,
-        ).view(-1, 1)
-        top_ps = torch.tensor(
-            [r.sampling_params.top_p for r in reqs], dtype=torch.float, device=device
-        )
-        top_ks = torch.tensor(
-            [r.sampling_params.top_k for r in reqs], dtype=torch.int32, device=device
-        )
-        min_ps = torch.tensor(
-            [r.sampling_params.min_p for r in reqs], dtype=torch.float, device=device
-        )
+        is_npu_dllm = batch.is_dllm() and _is_npu
+        if is_npu_dllm:
+            temperatures = torch.tensor(
+                [r.sampling_params.temperature for r in reqs],
+                dtype=torch.float,
+                pin_memory=True,
+            ).view(-1, 1).to(device,  non_blocking=True)
+            top_ps = torch.tensor(
+                [r.sampling_params.top_p for r in reqs], dtype=torch.float, pin_memory=True).to(device, non_blocking=True
+            )
+            top_ks = torch.tensor(
+                [r.sampling_params.top_k for r in reqs], dtype=torch.int32, pin_memory=True).to(device, non_blocking=True
+            )
+            min_ps = torch.tensor(
+                [r.sampling_params.min_p for r in reqs], dtype=torch.float, pin_memory=True).to(device, non_blocking=True
+            )
+        else:
+            temperatures = torch.tensor(
+                [r.sampling_params.temperature for r in reqs],
+                dtype=torch.float,
+                device=device,
+            ).view(-1, 1)
+            top_ps = torch.tensor(
+                [r.sampling_params.top_p for r in reqs], dtype=torch.float, device=device
+            )
+            top_ks = torch.tensor(
+                [r.sampling_params.top_k for r in reqs], dtype=torch.int32, device=device
+            )
+            min_ps = torch.tensor(
+                [r.sampling_params.min_p for r in reqs], dtype=torch.float, device=device
+            )
         sampling_seed = (
             torch.tensor(
                 [
