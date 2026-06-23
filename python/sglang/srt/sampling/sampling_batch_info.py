@@ -18,7 +18,6 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
-_is_npu = is_npu()
 
 @dataclasses.dataclass
 class SamplingBatchInfo:

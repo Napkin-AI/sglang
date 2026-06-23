@@ -378,7 +378,7 @@ def alloc_paged_token_slots_extend(
             extra_alloc_kwargs["dsv4_state_lens"] = dsv4_state_lens
 
     if batch.is_dllm():
-        extra_alloc_kwargs["use_clu_lens"] = _is_npu
+        extra_alloc_kwargs["use_cpu_lens"] = _is_npu
 
     out = allocator.alloc_extend(
         prefix_lens,
