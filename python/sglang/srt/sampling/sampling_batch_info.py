@@ -19,6 +19,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
 @dataclasses.dataclass
 class SamplingBatchInfo:
     # Basic batched sampling params
@@ -79,7 +80,6 @@ class SamplingBatchInfo:
 
         reqs = batch.reqs
         device = batch.device
-
         _pin = is_pin_memory_available(device)
         temperatures = (
             torch.tensor(
@@ -105,7 +105,6 @@ class SamplingBatchInfo:
             dtype=torch.float,
             pin_memory=_pin,
         ).to(device, non_blocking=True)
-
         sampling_seed = (
             torch.tensor(
                 [

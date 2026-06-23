@@ -25,7 +25,6 @@ from sglang.srt.mem_cache.triton_ops.common import (
     get_last_loc_triton_safe,
     write_req_to_token_pool_triton,
 )
-
 from sglang.srt.server_args import ServerArgs, get_global_server_args
 from sglang.srt.utils import is_hip, is_npu, support_triton
 from sglang.srt.utils.common import ceil_align, is_pin_memory_available
@@ -138,7 +137,6 @@ def write_cache_indices(
             dtype=torch.uint64,
             pin_memory=is_pin_memory_available(req_to_token_pool.device),
         ).to(req_to_token_pool.device, non_blocking=True)
-
         # TODO: some tensors can be reused for ForwardBatchInfo (e.g., extend_lens, cumsum_start)
         write_req_to_token_pool_triton[(req_pool_indices_tensor.shape[0],)](
             req_to_token_pool.req_to_token,
@@ -367,7 +365,6 @@ def alloc_paged_token_slots_extend(
 
     is_dsv4 = req_pool_indices is not None and hasattr(allocator, "c4_attn_allocator")
     extra_alloc_kwargs = {}
-
     if is_dsv4:
         extra_alloc_kwargs["req_pool_indices"] = req_pool_indices
         # Pass the per-req tables in per call for the c-pool / state last_loc
