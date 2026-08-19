@@ -51,7 +51,6 @@ def _init_guardrails(offload_to_cpu: bool = False) -> None:
     )
     _checker = CosmosSafetyChecker()
     idle_device = "cpu" if offload_to_cpu else current_platform.device_type
-
     for runner in (_checker.text_guardrail, _checker.video_guardrail):
         if runner is None or not hasattr(runner, "models"):
             continue
