@@ -466,7 +466,7 @@ class FP32LayerNorm(CustomOp, nn.LayerNorm):
                     "Installing this library may improve performance on NPU."
                     "See: sgl-project/sgl-kernel-npu"
                 )
-                self._forward_method = self.forward_native
+            #self._forward_method = self.forward_native
 
     def _cached_fp32_param(
         self, attr: str, param: torch.Tensor | None, device: torch.device
