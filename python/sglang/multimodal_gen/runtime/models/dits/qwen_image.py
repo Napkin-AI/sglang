@@ -901,6 +901,7 @@ class QwenImageCrossAttention(nn.Module):
                 AttentionBackendEnum.SAGE_ATTN_3,
                 AttentionBackendEnum.SPARGE_ATTN,
             },
+            quant_config=quant_config,
         )
 
     def _get_added_qkv_projections(
@@ -1105,6 +1106,14 @@ class QwenImageCrossAttention(nn.Module):
             joint_key = join_seqs(txt_key, img_key, sp_txt_pad)
             joint_value = join_seqs(txt_value, img_value, sp_txt_pad)
 
+        # TODO pass rot matrices to the attention cls to avoid extra matmuls here.
+        if "q_rot" in cross_attention_kwargs and "k_rot" in cross_attention_kwargs:
+            q_rot = cross_attention_kwargs["q_rot"].to(device=joint_query.devce, dtype=joint_query.dtype)
+            k_rot = cross_attention_kwargs["k_rot"].to(device=joint_key.devce, dtype=joint_key.dtype)
+
+            joint_query = torch.matmul(joint_query, q_rot)
+            joint_key = torch.matmul(joint_key, k_rot)
+
         # Compute joint attention
         joint_hidden_states = self.attn(
             joint_query,
@@ -1294,6 +1303,30 @@ class QwenImageTransformerBlock(nn.Module):
             hidden_size=dim, eps=eps, elementwise_affine=False
         )
 
+        self.use_offline_qk_rotation = self._has_modelslim_qk_rotation(
+            quant_config, prefix
+        )
+        if self.use_offline_qk_rotation:
+            self.register_buffer(
+                "q_rot",
+                torch.empty(
+                    attention_head_dim,
+                    attention_head_dim,
+                    dtype=torch.bfloat16,
+                ),
+                persistent=True,
+            )
+            self.register_buffer(
+                "k_rot",
+                torch.empty(
+                    attention_head_dim,
+                    attention_head_dim,
+                    dtype=torch.bfloat16,
+                ),
+                persistent=True,
+            )
+            quant_config.use_offline_qk_rotation=True
+
         self.attn = QwenImageCrossAttention(
             dim=dim,
             num_heads=num_attention_heads,
@@ -1405,6 +1438,29 @@ class QwenImageTransformerBlock(nn.Module):
         self._fp8_txt_attn_norm_quant = False
         self._fp8_img_mlp_norm_quant = False
         self._fp8_txt_mlp_norm_quant = False
+
+    def _has_modelslim_qk_rotation(
+        self,
+        quant_config: Optional[QuantizationConfig],
+        prefix: str,
+    ):
+        quant_description = getattr(quant_config, "quant_description")
+        if not isinstance(quant_config, dict):
+            return False
+
+        q_rot_key = f"{prefix}.q_rot"
+        k_rot_key = f"{prefix}.k_rot"
+
+        has_q_rot = q_rot_key in quant_description
+        has_k_rot = k_rot_key in quant_description
+
+        if has_q_rot != has_k_rot:
+            raise ValueError(
+                f"Quantization description must contain both {q_rot_key} and {k_rot_key} or neither."
+                "Probably you should requantize your model. "
+            )
+
+        return has_q_rot
 
     @staticmethod
     def _valid_modelopt_fp8_linear(linear: nn.Module) -> bool:
@@ -1876,6 +1932,9 @@ class QwenImageTransformerBlock(nn.Module):
         # 3. Concatenates and runs joint attention
         # 4. Splits results back to separate streams
         joint_attention_kwargs = joint_attention_kwargs or {}
+        if self.use_offline_qk_rotation:
+            joint_attention_kwargs["q_rot"] = self.q_rot
+            joint_attention_kwargs["k_rot"] = self.k_rot
         attn_output = self.attn(
             # Image stream (will be processed as "sample")
             hidden_states=img_modulated,

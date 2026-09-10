@@ -492,6 +492,10 @@ class WanTransformerBlock(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("to_out", prefix),
         )
+        self.hidden_dim = dim
+        self.num_attention_heads = num_heads
+        self.dim_head = dim // num_heads
+
         tp_size = get_tp_world_size()
         self.local_num_heads = divide(num_heads, tp_size)
         self_attn_backends = supported_attention_backends
@@ -509,6 +513,33 @@ class WanTransformerBlock(nn.Module):
                 prefix=add_prefix("attn1", prefix),
             )
         else:
+
+            quant_description = getattr(quant_config, "quant_description", {})
+            self.use_offline_qk_rotation = (
+                quant_description.get(f"{prefix}.q_rot") == "FLOAT"
+                and quant_description.get(f"{prefix}.k_rot") == "FLOAT"
+            )
+            if self.use_offline_qk_rotation:
+                self.register_buffer(
+                    "q_rot",
+                    torch.empty(
+                        self.dim_head,
+                        self.dim_head,
+                        dtype=torch.bfloat16,
+                    ),
+                    persistent=True,
+                )
+                self.register_buffer(
+                    "k_rot",
+                    torch.empty(
+                        self.dim_head,
+                        self.dim_head,
+                        dtype=torch.bfloat16,
+                    ),
+                    persistent=True,
+                )
+                quant_config.use_offline_qk_rotation = True
+
             self.attn1 = USPAttention(
                 num_heads=self.local_num_heads,
                 head_size=dim // num_heads,
@@ -519,9 +550,6 @@ class WanTransformerBlock(nn.Module):
                 is_cross_attention=False,
             )
 
-        self.hidden_dim = dim
-        self.num_attention_heads = num_heads
-        self.dim_head = dim // num_heads
         if qk_norm == "rms_norm":
             self.norm_q = RMSNorm(self.dim_head, eps=eps)
             self.norm_k = RMSNorm(self.dim_head, eps=eps)
@@ -683,6 +711,10 @@ class WanTransformerBlock(nn.Module):
                 _apply_rotary_emb(query, cos, sin, is_neox_style=False),
                 _apply_rotary_emb(key, cos, sin, is_neox_style=False),
             )
+
+        if self.use_offline_qk_rotation:
+            query = torch.matmul(query, self.q_rot.to(device=query.device, dtype=query.dtype))
+            key = torch.matmul(key, self.k_rot.to(device=key.device, dtype=key.dtype))
         attn_output = self.attn1(query, key, value)
         attn_output = attn_output.flatten(2)
         attn_output, _ = self.to_out(attn_output)

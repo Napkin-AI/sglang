@@ -620,12 +620,39 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
                 prefix=f"{prefix}.to_add_out" if prefix else "",
             )
 
+        quant_description = getattr(quant_config, "quant_description", {})
+        self.use_offline_qk_rotation = (
+            quant_description.get(f"{prefix}.q_rot") == "FLOAT"
+            and quant_description.get(f"{prefix}.k_rot") == "FLOAT"
+        )
+        if self.use_offline_qk_rotation:
+            self.register_buffer(
+                "q_rot",
+                torch.empty(
+                    self.head_dim,
+                    self.head_dim,
+                    dtype=torch.bfloat16,
+                ),
+                persistent=True,
+            )
+            self.register_buffer(
+                "k_rot",
+                torch.empty(
+                    self.head_dim,
+                    self.head_dim,
+                    dtype=torch.bfloat16,
+                ),
+                persistent=True,
+            )
+            quant_config.use_offline_qk_rotation = True
+
         self.attn = USPAttention(
             num_heads=self.local_heads if self.shard_qkv else num_heads,
             head_size=self.head_dim,
             dropout_rate=0,
             softmax_scale=None,
             causal=False,
+            quant_config=quant_config,
         )
 
     def forward(
@@ -698,6 +725,11 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
                 is_neox=False,
                 allow_inplace=True,
             )
+
+        # TODO pass rot matrices to the attention cls to avoid extra matmuls here.
+        if self.use_offline_qk_rotation:
+            query = torch.matmul(query, self.q_rot.to(query))
+            key = torch.matmul(key, self.k_rot.to(key))
 
         x = self.attn(
             query,

@@ -255,8 +255,12 @@ class AscendFAImpl(AttentionImpl):
     ) -> None:
         self.causal = causal
         self.softmax_scale = softmax_scale
-        self._quant_scheme = resolve_mx_fa_scheme(
-            extra_impl_args.get("quant_config")
+        quant_config = extra_impl_args.get("quant_config")
+        self._quant_scheme = resolve_mx_fa_scheme(quant_config)
+        self.use_offline_qk_rotation = (
+            quant_config.use_offline_qk_rotation
+            if hasattr(quant_config, "use_offline_qk_rotation")
+            else False
         )
         self._is_cross_attention = bool(
             extra_impl_args.get("is_cross_attention", False)
@@ -451,10 +455,11 @@ class AscendFAImpl(AttentionImpl):
                 "MXFP8 attention does not support returning softmax LSE"
             )
 
-        logger.info_once("Using online MXFP8 quantized Ascend Flash Attention.")
-        rotation = self._get_rotation(query.device, query.dtype)
-        query = torch.matmul(query, rotation)
-        key = torch.matmul(key, rotation)
+        logger.info_once("Using MXFP8 quantized Ascend Flash Attention.")
+        if not self.use_offline_qk_rotation:
+            rotation = self._get_rotation(query.device, query.dtype)
+            query = torch.matmul(query, rotation)
+            key = torch.matmul(key, rotation)
 
         num_heads = query.shape[1]
         num_kv_heads = key.shape[1]
