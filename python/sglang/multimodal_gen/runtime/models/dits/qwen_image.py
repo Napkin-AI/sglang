@@ -1303,8 +1303,11 @@ class QwenImageTransformerBlock(nn.Module):
             hidden_size=dim, eps=eps, elementwise_affine=False
         )
 
-        self.use_offline_qk_rotation = self._has_modelslim_qk_rotation(
-            quant_config, prefix
+        # TODO Need to create mxfp8 attention scheme and refactor the code below
+        quant_description = getattr(quant_config, "quant_description", {})
+        self.use_offline_qk_rotation = (
+            quant_description.get(f"{prefix}.q_rot") == "FLOAT"
+            and quant_description.get(f"{prefix}.k_rot") == "FLOAT"
         )
         if self.use_offline_qk_rotation:
             self.register_buffer(
@@ -1439,28 +1442,6 @@ class QwenImageTransformerBlock(nn.Module):
         self._fp8_img_mlp_norm_quant = False
         self._fp8_txt_mlp_norm_quant = False
 
-    def _has_modelslim_qk_rotation(
-        self,
-        quant_config: Optional[QuantizationConfig],
-        prefix: str,
-    ):
-        quant_description = getattr(quant_config, "quant_description")
-        if not isinstance(quant_config, dict):
-            return False
-
-        q_rot_key = f"{prefix}.q_rot"
-        k_rot_key = f"{prefix}.k_rot"
-
-        has_q_rot = q_rot_key in quant_description
-        has_k_rot = k_rot_key in quant_description
-
-        if has_q_rot != has_k_rot:
-            raise ValueError(
-                f"Quantization description must contain both {q_rot_key} and {k_rot_key} or neither."
-                "Probably you should requantize your model. "
-            )
-
-        return has_q_rot
 
     @staticmethod
     def _valid_modelopt_fp8_linear(linear: nn.Module) -> bool:

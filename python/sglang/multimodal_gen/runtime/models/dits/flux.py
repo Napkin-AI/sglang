@@ -620,6 +620,7 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
                 prefix=f"{prefix}.to_add_out" if prefix else "",
             )
 
+        # TODO Need to create mxfp8 attention scheme and refactor the code below
         quant_description = getattr(quant_config, "quant_description", {})
         self.use_offline_qk_rotation = (
             quant_description.get(f"{prefix}.q_rot") == "FLOAT"
@@ -726,10 +727,11 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
                 allow_inplace=True,
             )
 
-        # TODO pass rot matrices to the attention cls to avoid extra matmuls here.
         if self.use_offline_qk_rotation:
-            query = torch.matmul(query, self.q_rot.to(query))
-            key = torch.matmul(key, self.k_rot.to(key))
+            self.q_rot = self.q_rot.to(device=query.device, dtype=query.dtype)
+            self.k_rot = self.k_rot.to(device=key.device, dtype=key.dtype)
+            query = torch.matmul(query, self.q_rot)
+            key = torch.matmul(key, self.k_rot)
 
         x = self.attn(
             query,

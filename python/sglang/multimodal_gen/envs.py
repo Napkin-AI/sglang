@@ -234,7 +234,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Otherwise rotation matrix are generating online
     # Default value for MXFP8Config false, for ``ModelSlimConfig`` true
     "SGLANG_DIFFUSION_ENABLE_MXFP8_ATTENTION": _lazy_bool(
-        "SGLANG_DIFFUSION_FA_MXFP8", "false"
+        "SGLANG_DIFFUSION_ENABLE_MXFP8_ATTENTION", "false"
     ),
     # Use dedicated multiprocess context for workers.
     # Both spawn and fork work

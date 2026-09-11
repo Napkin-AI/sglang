@@ -201,7 +201,7 @@ class ModelSlimMXFP4Scheme(ModelSlimLinearScheme):
         if not self.is_dual_scale:
             if getattr(layer, "use_mul_scale", False):
                 x = x * layer.mul_scale.to(x.dtype)
-            return self.single_level_kernel.apply_weights(layer, x, bias)
+            return self.single_level_kernel.apply(layer, x, bias)
 
         original_dtype = x.dtype
         if original_dtype not in (torch.float16, torch.bfloat16):

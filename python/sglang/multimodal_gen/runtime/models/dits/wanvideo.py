@@ -513,11 +513,11 @@ class WanTransformerBlock(nn.Module):
                 prefix=add_prefix("attn1", prefix),
             )
         else:
-
+            # TODO Need to create mxfp8 attention scheme and refactor the code below
             quant_description = getattr(quant_config, "quant_description", {})
             self.use_offline_qk_rotation = (
-                quant_description.get(f"{prefix}.q_rot") == "FLOAT"
-                and quant_description.get(f"{prefix}.k_rot") == "FLOAT"
+                quant_description.get(f"{prefix}.attn1.q_rot") == "FLOAT"
+                and quant_description.get(f"{prefix}.attn1.k_rot") == "FLOAT"
             )
             if self.use_offline_qk_rotation:
                 self.register_buffer(
@@ -713,8 +713,11 @@ class WanTransformerBlock(nn.Module):
             )
 
         if self.use_offline_qk_rotation:
-            query = torch.matmul(query, self.q_rot.to(device=query.device, dtype=query.dtype))
-            key = torch.matmul(key, self.k_rot.to(device=key.device, dtype=key.dtype))
+            self.q_rot = self.q_rot.to(device=query.device, dtype=query.dtype)
+            self.k_rot = self.k_rot.to(device=key.device, dtype=key.dtype)
+            query = torch.matmul(query, self.q_rot)
+            key = torch.matmul(key, self.k_rot)
+
         attn_output = self.attn1(query, key, value)
         attn_output = attn_output.flatten(2)
         attn_output, _ = self.to_out(attn_output)

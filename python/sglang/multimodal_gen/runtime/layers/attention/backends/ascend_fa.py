@@ -16,7 +16,7 @@ from sglang.multimodal_gen.runtime.platforms import (
     current_platform,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.srt.environ import envs
+from sglang.multimodal_gen import envs
 
 logger = init_logger(__name__)
 
@@ -30,7 +30,7 @@ def resolve_mx_fa_scheme(quant_config) -> str | None:
     if (
         quant_config is None
         or not _is_npu
-        or not envs.SGLANG_DIFFUSION_ENABLE_MXFP8_ATTENTION.get()
+        or not envs.SGLANG_DIFFUSION_ENABLE_MXFP8_ATTENTION
     ):
         return None
     if type(quant_config).__name__ not in ("MXFP8Config", "ModelSlimConfig"):
