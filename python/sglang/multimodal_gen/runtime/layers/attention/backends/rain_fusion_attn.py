@@ -1,4 +1,5 @@
 import math
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -14,10 +15,16 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
 from sglang.multimodal_gen.runtime.layers.attention.backends.laser_attn import (
     LaserAttentionBackend,
 )
+from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+# ``blocks.<idx>.attn`` is a DiT layer; ``token_refiner.blocks.<idx>.attn`` and
+# anything else is not and stays dense.
+_DIT_LAYER_PREFIX = re.compile(r"^blocks\.(\d+)\.")
 
 
 class RainFusionAttentionBackend(AttentionBackend):
@@ -115,6 +122,19 @@ class RainFusionAttentionImpl(AttentionImpl):
         self.block_size = 128
         self.tile_size = 8
         self._is_a5 = torch_npu.npu.get_soc_version() == 260
+        sparse_config = get_global_server_args().attention_backend_config or {}
+        self.skip_first_steps = int(sparse_config.get("skip_first_steps", 10))
+        self.sparsity = float(sparse_config.get("sparsity", 0.2))
+        if self.skip_first_steps < 0 or not 0.0 <= self.sparsity < 1.0:
+            raise ValueError(
+                "Invalid Rain Fusion attention config: "
+                f"skip_first_steps={self.skip_first_steps}, "
+                f"sparsity={self.sparsity}"
+            )
+        # A layer outside the DiT stack (MiniMax-H3's token refiner) runs before
+        # the denoise loop, outside the forward context, and its text rows are
+        # shorter than one sparse block. It stays dense.
+        self.layer_enabled = _DIT_LAYER_PREFIX.match(prefix) is not None
         self.dense_attn_impl = LaserAttentionBackend.get_impl_cls()(
             num_heads,
             head_size,
@@ -134,9 +154,9 @@ class RainFusionAttentionImpl(AttentionImpl):
                 return input_tensor.new_empty((batch_size, 0, num_heads, head_dim))
             return input_tensor.mean(dim=1, keepdim=True)
 
-        tail_tokens = full_blocks * self.block_size
+        full_block_tokens = full_blocks * self.block_size
         full_blocks_pool = (
-            input_tensor[:, :tail_tokens]
+            input_tensor[:, :full_block_tokens]
             .reshape(batch_size, full_blocks, self.block_size, num_heads, head_dim)
             .mean(dim=2)
         )
@@ -144,7 +164,7 @@ class RainFusionAttentionImpl(AttentionImpl):
         if tail_tokens == 0:
             return full_blocks_pool
 
-        tail_pool = input_tensor[:, tail_tokens:].mean(dim=1, keepdim=True)
+        tail_pool = input_tensor[:, full_block_tokens:].mean(dim=1, keepdim=True)
         return torch.cat((full_blocks_pool, tail_pool), dim=1)
 
     def _rearrange_spatial_tokens(
@@ -249,9 +269,20 @@ class RainFusionAttentionImpl(AttentionImpl):
         self,
         qkv_pool: torch.Tensor,
         sparsity: float,
-        latent_shape: tuple[int, int, int],
+        latent_shape: tuple[int, int, int] | None,
     ) -> torch.Tensor:
         query_pool, key_pool, _ = torch.chunk(qkv_pool, 3, dim=0)
+        return self._build_sparse_mask_from_pools(
+            query_pool, key_pool, sparsity, latent_shape
+        )
+
+    def _build_sparse_mask_from_pools(
+        self,
+        query_pool: torch.Tensor,
+        key_pool: torch.Tensor,
+        sparsity: float,
+        latent_shape: tuple[int, int, int] | None,
+    ) -> torch.Tensor:
         attention_scores = (
             query_pool.permute(0, 2, 1, 3)
             @ key_pool.permute(0, 2, 3, 1)
@@ -265,11 +296,97 @@ class RainFusionAttentionImpl(AttentionImpl):
         ).values
         block_sparse_mask = probs >= retained_probabilities[..., -1:]
 
-        first_frame_tokens = latent_shape[1] * latent_shape[2]
-        first_frame_block_count = math.ceil(first_frame_tokens / self.block_size)
-        block_sparse_mask[:, :, :first_frame_block_count, :] = True
-        block_sparse_mask[:, :, :, :first_frame_block_count] = True
+        if latent_shape is not None:
+            first_frame_tokens = latent_shape[1] * latent_shape[2]
+            first_frame_block_count = math.ceil(first_frame_tokens / self.block_size)
+            block_sparse_mask[:, :, :first_frame_block_count, :] = True
+            block_sparse_mask[:, :, :, :first_frame_block_count] = True
         return block_sparse_mask.to(torch.int8)
+
+    def _build_varlen_sparse_mask(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        boundaries: tuple[int, ...],
+        max_seqlen: int,
+    ) -> tuple[torch.Tensor, list[int]]:
+        segment_lengths = [
+            stop - start
+            for start, stop in zip(boundaries[:-1], boundaries[1:])
+            if stop > start
+        ]
+        if not segment_lengths:
+            return query.new_empty((0, query.shape[1], 0, 0), dtype=torch.int8), []
+
+        actual_max_seqlen = max(segment_lengths)
+        if max_seqlen < actual_max_seqlen:
+            raise ValueError(
+                f"max_seqlen={max_seqlen} is smaller than the longest packed "
+                f"sequence ({actual_max_seqlen})"
+            )
+        max_block_count = math.ceil(actual_max_seqlen / self.block_size)
+
+        masks = []
+        for start, stop in zip(boundaries[:-1], boundaries[1:]):
+            if stop == start:
+                continue
+            query_pool = self._pool_token_blocks(query[start:stop].unsqueeze(0))
+            key_pool = self._pool_token_blocks(key[start:stop].unsqueeze(0))
+            mask = self._build_sparse_mask_from_pools(
+                query_pool,
+                key_pool,
+                self.sparsity,
+                None,
+            )
+            block_count = mask.shape[-1]
+            masks.append(
+                torch.nn.functional.pad(
+                    mask,
+                    (
+                        0,
+                        max_block_count - block_count,
+                        0,
+                        max_block_count - block_count,
+                    ),
+                )
+            )
+
+        # npu_block_sparse_attention validates sum(actual_seq_lengths) == T: it
+        # takes per-batch lengths, not the cumulative TND offsets that
+        # npu_fused_infer_attention_score takes.
+        return torch.cat(masks, dim=0), segment_lengths
+
+    def _rain_fusion_sparse_attention_varlen(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        boundaries: tuple[int, ...],
+        max_seqlen: int,
+    ) -> torch.Tensor:
+        block_sparse_mask, actual_seq_lengths = self._build_varlen_sparse_mask(
+            query, key, boundaries, max_seqlen
+        )
+        if not actual_seq_lengths:
+            return torch.empty_like(query)
+
+        output, _ = torch_npu.npu_block_sparse_attention(
+            query.contiguous(),
+            key.contiguous(),
+            value.contiguous(),
+            block_sparse_mask,
+            [self.block_size, self.block_size],
+            q_input_layout="TND",
+            kv_input_layout="TND",
+            num_key_value_heads=key.shape[1],
+            scale_value=self.softmax_scale,
+            inner_precise=4 if self._is_a5 else 0,
+            actual_seq_lengths=actual_seq_lengths,
+            actual_seq_lengths_kv=actual_seq_lengths,
+            softmax_lse_flag=0,
+        )
+        return output
 
     def _block_sparse_attention(
         self,
@@ -447,4 +564,59 @@ class RainFusionAttentionImpl(AttentionImpl):
             value,
             attn_metadata.latent_shape,
             attn_metadata.sparsity,
+        )
+
+    def forward_varlen(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        cu_seqlens_host: tuple[int, ...] | None = None,
+    ) -> torch.Tensor:
+        """Run packed self-attention for TND ``[total_tokens, heads, dim]`` input."""
+        boundaries = (
+            cu_seqlens_host
+            if cu_seqlens_host is not None
+            else tuple(int(item) for item in cu_seqlens.tolist())
+        )
+        if (
+            len(boundaries) < 2
+            or boundaries[0] != 0
+            or boundaries[-1] != query.shape[0]
+            or any(
+                stop < start
+                for start, stop in zip(boundaries[:-1], boundaries[1:])
+            )
+        ):
+            raise ValueError(
+                "cu_seqlens must start at 0, be non-decreasing, and end at "
+                f"the packed token count {query.shape[0]}"
+            )
+        if query.shape[0] != key.shape[0] or key.shape[:2] != value.shape[:2]:
+            raise ValueError(
+                "Rain Fusion TND self-attention requires matching Q/K/V token "
+                "counts and matching K/V head counts"
+            )
+
+        if (
+            not self.layer_enabled
+            or get_forward_context().current_timestep < self.skip_first_steps
+        ):
+            return self.dense_attn_impl.forward_varlen(
+                query,
+                key,
+                value,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                cu_seqlens_host=boundaries,
+            )
+        return self._rain_fusion_sparse_attention_varlen(
+            query,
+            key,
+            value,
+            boundaries=boundaries,
+            max_seqlen=max_seqlen,
         )
