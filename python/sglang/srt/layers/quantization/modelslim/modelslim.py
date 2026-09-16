@@ -215,6 +215,10 @@ class ModelSlimConfig(QuantizationConfig):
         candidates = [prefix]
         if ".mlp." in prefix:
             candidates.append(prefix.replace(".mlp.", ".block_sparse_moe."))
+        if prefix.endswith(".gate_up_proj"):
+            candidates.append(
+                prefix.removesuffix(".gate_up_proj") + ".gate_and_up_proj"
+            )
 
         for candidate in list(candidates):
             if candidate.startswith("language_model."):
@@ -349,6 +353,7 @@ class ModelSlimConfig(QuantizationConfig):
         #   (w1, w3, w2)                      – MiniMax-M2.5 / some other models
         naming_conventions = [
             ("gate_proj", "up_proj", "down_proj"),
+            ("gate_and_up_proj", "gate_and_up_proj", "down_proj"),
             ("w1", "w3", "w2"),
         ]
 

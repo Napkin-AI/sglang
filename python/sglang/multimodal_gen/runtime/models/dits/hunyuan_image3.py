@@ -41,6 +41,7 @@ from sglang.srt.models.hunyuan import (
     _get_cla_factor,
     _is_moe,
 )
+from sglang.srt.models.transformers import maybe_prefix
 
 from .hunyuan_image3_utils import (
     CachedRoPE,
@@ -949,22 +950,22 @@ class HunyuanImage3Model(nn.Module):
 
         return hidden_states.contiguous()
 
-    def _split_qkv_weight(self, qkv):
+    def _split_qkv_tensor(self, qkv):
         num_attention_heads = self.config.num_attention_heads
         num_kv_heads = getattr(
             self.config, "num_key_value_heads", self.config.num_attention_heads
         )
         num_key_value_groups = num_attention_heads // num_kv_heads
-        hidden_size = self.config.hidden_size
-        attention_head_dim = hidden_size // num_attention_heads
+        attention_head_dim = self.config.hidden_size // num_attention_heads
+        inner_size = qkv.shape[-1]
 
         qkv = qkv.reshape(
-            num_kv_heads, num_key_value_groups + 2, attention_head_dim, hidden_size
+            num_kv_heads, num_key_value_groups + 2, attention_head_dim, inner_size
         )
         q, k, v = torch.split(qkv, (num_key_value_groups, 1, 1), dim=1)
-        q = q.reshape(-1, hidden_size)
-        k = k.reshape(-1, hidden_size)
-        v = v.reshape(-1, hidden_size)
+        q = q.reshape(-1, inner_size)
+        k = k.reshape(-1, inner_size)
+        v = v.reshape(-1, inner_size)
         return torch.concat((q, k, v))
 
 
@@ -973,6 +974,7 @@ class HunyuanImage3ForCausalMM(CachableDiT):
         self,
         config: HunyuanImage3DitConfig,
         prefix: str = "",
+        quant_config: Optional[QuantizationConfig] = None,
         **kwargs,
     ):
         super().__init__(config=config, **kwargs)
@@ -981,7 +983,8 @@ class HunyuanImage3ForCausalMM(CachableDiT):
 
         self.model = HunyuanImage3Model(
             arch_config,
-            prefix=f"{prefix}.model",
+            quant_config=quant_config,
+            prefix=maybe_prefix(prefix, "model"),
         )
 
         self.unpadded_vocab_size = arch_config.vocab_size
@@ -991,7 +994,7 @@ class HunyuanImage3ForCausalMM(CachableDiT):
             self.unpadded_vocab_size,
             arch_config.hidden_size,
             org_num_embeddings=self.unpadded_vocab_size,
-            prefix=f"{prefix}.lm_head",
+            prefix=maybe_prefix(prefix, "lm_head"),
         )
         if getattr(arch_config, "tie_word_embeddings", False):
             self.lm_head.weight = self.model.embed_tokens.weight
@@ -1137,7 +1140,7 @@ class HunyuanImage3ForCausalMM(CachableDiT):
                 ".qkv_proj",
                 num_attention_heads + num_kv_heads * 2,
                 [("q", num_attention_heads), ("k", num_kv_heads), ("v", num_kv_heads)],
-                self.model._split_qkv_weight,
+                self.model._split_qkv_tensor,
             ),
         ]
 

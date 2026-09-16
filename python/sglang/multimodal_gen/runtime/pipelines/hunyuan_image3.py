@@ -16,6 +16,7 @@ from sglang.multimodal_gen.runtime.layers.attention.selector import (
 from sglang.multimodal_gen.runtime.loader.fsdp_load import shard_model
 from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
     resolve_transformer_checkpoint_files,
+    resolve_transformer_quant_load_spec,
 )
 from sglang.multimodal_gen.runtime.loader.utils import set_default_torch_dtype
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
@@ -52,6 +53,12 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.precision import set_mixed_precision_policy
 from sglang.multimodal_gen.runtime.utils.precision_types import PRECISION_TO_TYPE
+from sglang.multimodal_gen.runtime.utils.quantization_utils import (
+    process_model_weights_after_loading,
+)
+from sglang.srt.layers.quantization.modelslim.modelslim import (
+    ModelSlimConfig as SRTModelSlimConfig,
+)
 
 logger = init_logger(__name__)
 
@@ -134,6 +141,24 @@ class HunyuanImage3Pipeline(LoRAPipeline, ComposedPipelineBase):
         safetensors_list = list(
             resolve_transformer_checkpoint_files(server_args, model_path).safetensors
         )
+        quant_spec = resolve_transformer_quant_load_spec(
+            hf_config=config_dict,
+            server_args=server_args,
+            safetensors_list=safetensors_list,
+            component_model_path=model_path,
+            model_cls=HunyuanImage3ForCausalMM,
+            cls_name=HunyuanImage3ForCausalMM.__name__,
+            component_name="transformer",
+            arch_config=pipeline_config.dit_config.arch_config,
+        )
+        safetensors_list = quant_spec.safetensors_list
+        quant_config = quant_spec.quant_config
+
+        # This backbone uses SRT tensor-parallel Linear and FusedMoE layers.
+        # Adapt the generic diffusion ModelSlim metadata to the SRT config that
+        # owns the Ascend MXFP8 dense and MoE kernels.
+        if quant_config is not None and quant_config.get_name() == "modelslim":
+            quant_config = SRTModelSlimConfig(dict(quant_config.quant_description))
 
         local_torch_device = get_local_torch_device()
         cpu_offload = bool(server_args.dit_cpu_offload)
@@ -165,6 +190,7 @@ class HunyuanImage3Pipeline(LoRAPipeline, ComposedPipelineBase):
                 model = HunyuanImage3ForCausalMM(
                     config=pipeline_config.dit_config,
                     hf_config=config_dict,
+                    quant_config=quant_config,
                 )
 
             weights_to_load = {name for name, _ in model.named_parameters()}
@@ -178,6 +204,7 @@ class HunyuanImage3Pipeline(LoRAPipeline, ComposedPipelineBase):
                     f"{sorted(weights_not_loaded)}"
                 )
 
+            process_model_weights_after_loading(model)
             model.post_load_weights()
             for param in model.parameters():
                 param.requires_grad = False
@@ -345,7 +372,23 @@ class HunyuanImage3Pipeline(LoRAPipeline, ComposedPipelineBase):
     def _collect_prefixed_weights(
         model_path: str, prefix: str
     ) -> dict[str, torch.Tensor]:
-        index_path = os.path.join(model_path, "model.safetensors.index.json")
+        index_candidates = (
+            "quant_model_weights.safetensors.index.json",
+            "model.safetensors.index.json",
+        )
+        index_path = next(
+            (
+                os.path.join(model_path, name)
+                for name in index_candidates
+                if os.path.isfile(os.path.join(model_path, name))
+            ),
+            None,
+        )
+        if index_path is None:
+            raise FileNotFoundError(
+                f"No supported safetensors index found in {model_path}: "
+                f"expected one of {index_candidates}"
+            )
         with open(index_path) as f:
             weight_map = json.load(f)["weight_map"]
         shard_names = sorted(

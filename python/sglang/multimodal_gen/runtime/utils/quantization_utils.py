@@ -39,9 +39,11 @@ from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.layers.linear import LinearBase as SrtLinearBase
 from sglang.srt.layers.modelopt_utils import canonicalize_modelopt_quant_algo
+from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.layers.quantization.unquant import (
     UnquantizedEmbeddingMethod as SrtUnquantizedEmbeddingMethod,
 )
+from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.layers.quantization.unquant import (
     UnquantizedLinearMethod as SrtUnquantizedLinearMethod,
 )
@@ -66,6 +68,9 @@ def process_model_weights_after_loading(
     """Process native and SRT layers once, optionally staging one layer at a time."""
     processed_layers = 0
     for module in model.modules():
+        method = getattr(module, "quant_method", None)
+        if method is None:
+            continue
         if not isinstance(
             module,
             (
@@ -74,10 +79,7 @@ def process_model_weights_after_loading(
                 VocabParallelEmbedding,
                 SrtVocabParallelEmbedding,
             ),
-        ):
-            continue
-        method = module.quant_method
-        if method is None:
+        ) and not isinstance(method, FusedMoEMethodBase):
             continue
         unquantized = isinstance(
             method,
@@ -86,6 +88,7 @@ def process_model_weights_after_loading(
                 SrtUnquantizedLinearMethod,
                 UnquantizedEmbeddingMethod,
                 SrtUnquantizedEmbeddingMethod,
+                UnquantizedFusedMoEMethod,
             ),
         )
         if quantized_only and unquantized:
