@@ -11,6 +11,7 @@ import math
 import os
 from collections import defaultdict
 from collections.abc import Iterable, Iterator
+from functools import partial
 from typing import Any, Callable
 
 import torch
@@ -115,9 +116,21 @@ def _reject_non_lora_delta_tensors(adapter: dict[str, torch.Tensor]) -> None:
 
 def _diffusers_h3_checkpoint(
     iterator: Iterable[tuple[str, torch.Tensor]],
+    *,
+    preserve_weight_scale_name: bool = False,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Map Diffusers H3 names/layout to the fused native checkpoint layout."""
-    mapping = get_param_names_mapping(_ARCH_DEFAULTS.param_names_mapping)
+    mapping_dict = _ARCH_DEFAULTS.param_names_mapping
+    if preserve_weight_scale_name:
+        # ModelSlim W8A8 linears register ``weight_scale`` directly. The
+        # ``weight_scale_inv`` alias in the general H3 mapping belongs to FP8
+        # checkpoints and must not be applied to an AscendV1 export.
+        mapping_dict = {
+            pattern: replacement
+            for pattern, replacement in mapping_dict.items()
+            if pattern != r"^(.*)\.weight_scale$"
+        }
+    mapping = get_param_names_mapping(mapping_dict)
     pending: dict[str, dict[int, torch.Tensor]] = defaultdict(dict)
 
     for source_name, tensor in iterator:
@@ -154,6 +167,35 @@ def _diffusers_h3_checkpoint(
     if pending:
         incomplete = ", ".join(sorted(pending))
         raise ValueError(f"Incomplete Diffusers H3 fused parameters: {incomplete}")
+
+
+def _diffusers_h3_modelslim_checkpoint(
+    iterator: Iterable[tuple[str, torch.Tensor]],
+    *,
+    inv_freq_len: int = _ARCH_DEFAULTS.rope_inv_freq_len,
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Convert a Diffusers-layout ModelSlim checkpoint to native H3 names."""
+    saw_inv_freq = False
+    for name, tensor in _diffusers_h3_checkpoint(
+        iterator, preserve_weight_scale_name=True
+    ):
+        saw_inv_freq = saw_inv_freq or name == "rope.inv_freq"
+        yield name, tensor
+
+    if not saw_inv_freq:
+        # Diffusers constructs H3 RoPE frequencies from the fixed base instead
+        # of serializing them. ModelSlim consequently omits this persistent
+        # native SGLang buffer from its AscendV1 export. Materialize the exact
+        # checkpoint value here rather than letting the generic missing-value
+        # path initialize it to zeros.
+        yield (
+            "rope.inv_freq",
+            torch.exp(
+                -math.log(10000.0)
+                * torch.arange(inv_freq_len, dtype=_FP32_DTYPE)
+                / inv_freq_len
+            ),
+        )
 
 
 _BF16_DTYPE = torch.bfloat16
@@ -1879,7 +1921,14 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         )
         self.arch = arch
         if arch.checkpoint_uses_diffusers_layout:
-            self.preprocess_loaded_state_dict = _diffusers_h3_checkpoint
+            self.preprocess_loaded_state_dict = (
+                partial(
+                    _diffusers_h3_modelslim_checkpoint,
+                    inv_freq_len=arch.rope_inv_freq_len,
+                )
+                if quant_config is not None and quant_config.get_name() == "modelslim"
+                else _diffusers_h3_checkpoint
+            )
         self.hidden_size = arch.hidden_size
         self.num_attention_heads = arch.num_attention_heads
         self.num_channels_latents = arch.latents_dim

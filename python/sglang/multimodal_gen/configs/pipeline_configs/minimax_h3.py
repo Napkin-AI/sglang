@@ -79,7 +79,7 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
         return True
 
     def supports_disaggregation(self) -> bool:
-        return False
+        return True
 
     @property
     def requires_audio_output(self) -> bool:

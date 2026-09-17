@@ -121,11 +121,7 @@ class ModelSlimConfig(QuantizationConfig):
         self,
         layer_name: str,
     ) -> ModelSlimLinearScheme:
-        full_weight_name = layer_name + ".weight"
-        if self._name_mapper is not None:
-            mapped_name, _, _ = self._name_mapper(full_weight_name)
-        else:
-            mapped_name = full_weight_name
+        mapped_name = self._map_weight_name(layer_name)
 
         quant_type = self.quant_description.get(mapped_name, "")
         prefix = mapped_name.removesuffix(".weight")
@@ -147,8 +143,17 @@ class ModelSlimConfig(QuantizationConfig):
             return ModelSlimMXFP4Scheme()
         raise NotImplementedError(
             f"No modelslim compatible scheme was found for layer '{layer_name}'. "
-            f"quant_description['{layer_name}.weight'] = '{quant_type}'"
+            f"quant_description['{mapped_name}'] = '{quant_type}'"
         )
+
+    def _map_weight_name(self, layer_name: str) -> str:
+        """Map a runtime linear prefix to its checkpoint description key."""
+        full_weight_name = layer_name + ".weight"
+        if self._name_mapper is not None:
+            mapped_name, _, _ = self._name_mapper(full_weight_name)
+        else:
+            mapped_name = full_weight_name
+        return mapped_name
 
     def get_scheme(
         self, layer: torch.nn.Module, layer_name: Optional[str] = None
@@ -179,7 +184,10 @@ class ModelSlimConfig(QuantizationConfig):
             is_skipped = None
             for shard_prefix in shard_prefixes:
                 is_shard_skipped = (
-                    self.quant_description.get(shard_prefix + ".weight", "") == "FLOAT"
+                    self.quant_description.get(
+                        self._map_weight_name(shard_prefix), ""
+                    )
+                    == "FLOAT"
                 )
 
                 if is_skipped is None:
@@ -191,7 +199,10 @@ class ModelSlimConfig(QuantizationConfig):
                         "to have the same precision."
                     )
         else:
-            is_skipped = self.quant_description.get(prefix + ".weight", "") == "FLOAT"
+            is_skipped = (
+                self.quant_description.get(self._map_weight_name(prefix), "")
+                == "FLOAT"
+            )
 
         assert is_skipped is not None
         return is_skipped

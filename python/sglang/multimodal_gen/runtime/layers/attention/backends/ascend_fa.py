@@ -224,11 +224,11 @@ class AscendFAImpl(AttentionImpl):
             seq_len = query.shape[1]
             mask = torch.triu(
                 torch.ones(seq_len, seq_len, device=query.device), diagonal=1
-            ).bool()
+            ).bool().unsqueeze(0)
         # transpose to bs, heads, seq_len, head_dim
         query = query.transpose(1, 2)
-        key = key.transpose(1, 2)
-        value = value.transpose(1, 2)
+        key = key.transpose(1, 2).contiguous()
+        value = value.transpose(1, 2).contiguous()
         output, lse = torch.ops.npu.npu_fused_infer_attention_score(
             query,
             key,

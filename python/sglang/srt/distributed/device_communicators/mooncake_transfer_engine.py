@@ -198,26 +198,70 @@ class MooncakeTransferEngine:
         device_name: Optional[str],
     ) -> None:
         """Initialize the mooncake instance."""
-        if envs.ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE.get():
+        use_ascend = envs.ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE.get()
+
+        if use_ascend:
             npu_phy_id = envs.ASCEND_NPU_PHY_ID.get()
             suffix = self.gpu_id if npu_phy_id == -1 else npu_phy_id
             hostname += f":{get_free_port()}:npu_{suffix}"
             protocol = "ascend"
         else:
-            # MOONCAKE_PROTOCOL selects the transport (rdma | efa | tcp | ...).
-            # Default is "rdma"; set MOONCAKE_PROTOCOL=efa on AWS EFA hardware.
             protocol = envs.MOONCAKE_PROTOCOL.get()
 
-        ret_value = run_with_deadline(
-            lambda: self.engine.initialize(
+        def _initialize():
+            import threading
+            import torch
+
+            logger.warning(
+                "Before Mooncake init: tid=%s gpu_id=%s initialized=%s current_device=%s",
+                threading.get_ident(),
+                self.gpu_id,
+                torch.npu.is_initialized(),
+                torch.npu.current_device(),
+            )
+
+            torch.npu.set_device(self.gpu_id)
+
+            # Force actual runtime/context creation.
+            torch.npu.init()
+
+            dummy = torch.empty(
+                1,
+                dtype=torch.uint8,
+                device=f"npu:{self.gpu_id}",
+            )
+            torch.npu.synchronize()
+
+            logger.warning(
+                "After NPU warmup: initialized=%s current_device=%s ptr=%#x",
+                torch.npu.is_initialized(),
+                torch.npu.current_device(),
+                dummy.data_ptr(),
+            )
+
+            return self.engine.initialize(
                 hostname,
                 "P2PHANDSHAKE",
                 protocol,
                 device_name if device_name is not None else "",
-            ),
+            )
+
+
+        ret_value = run_with_deadline(
+            _initialize,
             timeout_s=envs.SGLANG_DISAGGREGATION_ENGINE_INIT_TIMEOUT.get(),
             what=f"Mooncake TransferEngine.initialize({hostname!r}, {protocol!r}, {device_name!r})",
         )
+
+        ret_value = run_with_deadline(
+            _initialize,
+            timeout_s=envs.SGLANG_DISAGGREGATION_ENGINE_INIT_TIMEOUT.get(),
+            what=(
+                f"Mooncake TransferEngine.initialize("
+                f"{hostname!r}, {protocol!r}, {device_name!r})"
+            ),
+        )
+
         if ret_value != 0:
             logger.error("Mooncake Transfer Engine initialization failed.")
             raise RuntimeError("Mooncake Transfer Engine initialization failed.")

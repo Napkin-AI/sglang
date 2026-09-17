@@ -83,6 +83,71 @@ class MiniMaxH3DiTArchConfig(DiTArchConfig):
         }
     )
 
+    # ModelSlim writes its per-layer quantization description with the source
+    # Diffusers names. Runtime linears use the fused native names above, so the
+    # quantization loader needs an unambiguous native-to-source lookup as well.
+    # For fused QKV, inspecting to_q is sufficient: H3 exports Q/K/V with the
+    # same scheme and the checkpoint converter still merges all three tensors.
+    reverse_param_names_mapping: dict = field(
+        default_factory=lambda: {
+            r"^video_patch_proj\.(.*)$": r"proj_in.\1",
+            r"^audio_patch_proj\.(.*)$": r"audio_proj_in.\1",
+            r"^condition_proj\.(.*)$": r"context_embedder.\1",
+            r"^time_embedder\.proj_in\.(.*)$": r"time_embedder.linear_1.\1",
+            r"^time_embedder\.proj_out\.(.*)$": r"time_embedder.linear_2.\1",
+            r"^adaln_t_table$": r"time_embedder.table",
+            r"^final_layer\.norm\.(.*)$": r"norm_out.norm.\1",
+            r"^final_layer\.adaln_proj\.linear\.(.*)$": r"norm_out.linear.\1",
+            r"^final_layer\.video_out\.(.*)$": r"proj_out.\1",
+            r"^final_layer\.audio_out\.(.*)$": r"audio_proj_out.\1",
+            r"^blocks\.(\d+)\.adaln_proj\.linear\.(.*)$": (
+                r"transformer_blocks.\1.adaln_proj.linear.\2"
+            ),
+            r"^blocks\.(\d+)\.attn\.qkv_proj\.(.*)$": (
+                r"transformer_blocks.\1.attn.to_q.\2"
+            ),
+            r"^blocks\.(\d+)\.attn\.out_proj\.(.*)$": (
+                r"transformer_blocks.\1.attn.to_out.0.\2"
+            ),
+            r"^blocks\.(\d+)\.attn\.q_norm\.(.*)$": (
+                r"transformer_blocks.\1.attn.norm_q.\2"
+            ),
+            r"^blocks\.(\d+)\.attn\.k_norm\.(.*)$": (
+                r"transformer_blocks.\1.attn.norm_k.\2"
+            ),
+            r"^blocks\.(\d+)\.mlp\.fc1\.(.*)$": (
+                r"transformer_blocks.\1.ff.net.0.proj.\2"
+            ),
+            r"^blocks\.(\d+)\.mlp\.fc2\.(.*)$": (
+                r"transformer_blocks.\1.ff.net.2.\2"
+            ),
+            r"^blocks\.(\d+)\.norm([12])\.(.*)$": (
+                r"transformer_blocks.\1.norm\2.\3"
+            ),
+            r"^token_refiner\.blocks\.(\d+)\.attn\.qkv_proj\.(.*)$": (
+                r"token_refiner.refiner_blocks.\1.attn.to_q.\2"
+            ),
+            r"^token_refiner\.blocks\.(\d+)\.attn\.out_proj\.(.*)$": (
+                r"token_refiner.refiner_blocks.\1.attn.to_out.0.\2"
+            ),
+            r"^token_refiner\.blocks\.(\d+)\.attn\.q_norm\.(.*)$": (
+                r"token_refiner.refiner_blocks.\1.attn.norm_q.\2"
+            ),
+            r"^token_refiner\.blocks\.(\d+)\.attn\.k_norm\.(.*)$": (
+                r"token_refiner.refiner_blocks.\1.attn.norm_k.\2"
+            ),
+            r"^token_refiner\.blocks\.(\d+)\.mlp\.fc1\.(.*)$": (
+                r"token_refiner.refiner_blocks.\1.ff.net.0.proj.\2"
+            ),
+            r"^token_refiner\.blocks\.(\d+)\.mlp\.fc2\.(.*)$": (
+                r"token_refiner.refiner_blocks.\1.ff.net.2.\2"
+            ),
+            r"^token_refiner\.blocks\.(\d+)\.norm([12])\.(.*)$": (
+                r"token_refiner.refiner_blocks.\1.norm\2.\3"
+            ),
+        }
+    )
+
     num_layers: int = 50
     token_refiner_num_layers: int = 2
     hidden_size: int = 5376

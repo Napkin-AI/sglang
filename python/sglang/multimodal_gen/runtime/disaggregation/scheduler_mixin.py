@@ -159,6 +159,10 @@ _SAMPLING_PARAMS_EXCLUDE_FIELDS = frozenset(
 # Receivers reconstruct base SamplingParams, so only base defaults can be omitted.
 _BASE_SAMPLING_PARAM_FIELDS = {f.name: f for f in dataclasses.fields(SamplingParams)}
 
+_EXTRA_TENSOR_TREE_PREFIX = "_extra_tensor_tree_"
+_EXTRA_TENSOR_FIELD_PREFIX = "_extra_tensor_"
+_EXTRA_TENSOR_REF_KEY = "__sglang_disagg_tensor__"
+
 
 def _is_tensor_like(value) -> bool:
     if isinstance(value, torch.Tensor):
@@ -205,8 +209,68 @@ def _is_default(value, field_info) -> bool:
     return False
 
 
-def _extract_extra_fields(extra: dict, scalar_fields: dict) -> None:
-    """Extract JSON-serializable entries from Req.extra into scalar_fields."""
+def _encode_extra_tensor_tree(
+    value: Any,
+    tensor_fields: dict,
+    tensor_refs: dict[int, str],
+    tensor_namespace: str,
+) -> Any:
+    """Replace tensors nested in a JSON-like value with transfer references."""
+    if isinstance(value, torch.Tensor):
+        tensor_id = id(value)
+        field_name = tensor_refs.get(tensor_id)
+        if field_name is None:
+            field_name = (
+                f"{_EXTRA_TENSOR_FIELD_PREFIX}{tensor_namespace}_"
+                f"{len(tensor_fields)}"
+            )
+            tensor_fields[field_name] = value
+            tensor_refs[tensor_id] = field_name
+        return {_EXTRA_TENSOR_REF_KEY: field_name}
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, dict):
+        return {
+            key: _encode_extra_tensor_tree(
+                item, tensor_fields, tensor_refs, tensor_namespace
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [
+            _encode_extra_tensor_tree(
+                item, tensor_fields, tensor_refs, tensor_namespace
+            )
+            for item in value
+        ]
+    return value
+
+
+def _restore_extra_tensor_tree(value: Any, tensor_fields: dict) -> Any:
+    """Restore tensor references produced by :func:`_encode_extra_tensor_tree`."""
+    if isinstance(value, dict):
+        if set(value) == {_EXTRA_TENSOR_REF_KEY}:
+            field_name = value[_EXTRA_TENSOR_REF_KEY]
+            if field_name not in tensor_fields:
+                raise ValueError(
+                    f"Missing tensor field {field_name!r} for Req.extra payload"
+                )
+            return tensor_fields[field_name]
+        return {
+            key: _restore_extra_tensor_tree(item, tensor_fields)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_restore_extra_tensor_tree(item, tensor_fields) for item in value]
+    return value
+
+
+def _extract_extra_fields(
+    extra: dict,
+    tensor_fields: dict,
+    scalar_fields: dict,
+) -> None:
+    """Extract JSON values and nested tensor trees from ``Req.extra``."""
     for key, value in extra.items():
         if key.startswith("_"):
             continue
@@ -214,7 +278,21 @@ def _extract_extra_fields(extra: dict, scalar_fields: dict) -> None:
             json.dumps(value)
             scalar_fields[f"_extra_{key}"] = value
         except (TypeError, ValueError, OverflowError):
-            pass
+            nested_tensors: dict[str, torch.Tensor] = {}
+            tensor_refs = {
+                id(item): name
+                for name, item in tensor_fields.items()
+                if isinstance(item, torch.Tensor)
+            }
+            encoded = _encode_extra_tensor_tree(
+                value, nested_tensors, tensor_refs, str(key)
+            )
+            try:
+                json.dumps(encoded)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            scalar_fields[f"{_EXTRA_TENSOR_TREE_PREFIX}{key}"] = encoded
+            tensor_fields.update(nested_tensors)
 
 
 def _init_request_scheduler(scheduler: Any, req: Req, device: torch.device) -> None:
@@ -300,7 +378,7 @@ def extract_transfer_fields(req) -> tuple[dict, dict]:
 
     extra = getattr(req, "extra", None)
     if extra:
-        _extract_extra_fields(extra, scalar_fields)
+        _extract_extra_fields(extra, tensor_fields, scalar_fields)
 
     sp = getattr(req, "sampling_params", None)
     if sp is not None:
@@ -1411,6 +1489,23 @@ class SchedulerDisaggMixin:
                 object.__setattr__(req, f.name, f.default_factory())
         # Ensure sampling_params is not None so __getattr__ delegation works
         object.__setattr__(req, "sampling_params", SamplingParams())
+        # Restore nested tensor payloads before the generic _extra_* loop. The
+        # transferred tensor entries are consumed here and must not become
+        # stray attributes on Req.
+        tensor_tree_keys = [
+            key
+            for key in scalar_fields
+            if key.startswith(_EXTRA_TENSOR_TREE_PREFIX)
+        ]
+        for key in tensor_tree_keys:
+            extra_key = key[len(_EXTRA_TENSOR_TREE_PREFIX) :]
+            req.extra[extra_key] = _restore_extra_tensor_tree(
+                scalar_fields.pop(key), tensors
+            )
+        for key in [
+            name for name in tensors if name.startswith(_EXTRA_TENSOR_FIELD_PREFIX)
+        ]:
+            tensors.pop(key)
         # Restore _extra_* prefixed fields into req.extra dict
         extra_keys = [k for k in scalar_fields if k.startswith("_extra_")]
         for key in extra_keys:

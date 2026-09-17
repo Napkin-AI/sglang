@@ -705,7 +705,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         )
         tags = packed["token_tags"]
         tags[packed["text_pos"].view(-1)] = (
-            emb["text_token_tags"].view(-1).to(torch.long)
+            emb["text_token_tags"].view(-1).to(device=tags.device, dtype=torch.long)
         )
         video_query_indices = None
         if subblock_enabled:

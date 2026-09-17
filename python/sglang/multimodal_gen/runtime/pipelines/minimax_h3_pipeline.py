@@ -133,13 +133,6 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
             )
         return model_index
 
-    def validate_disagg_role(self, role: RoleType) -> None:
-        if role != RoleType.MONOLITHIC:
-            raise ValueError(
-                "MiniMaxH3Pipeline only supports monolithic deployment; "
-                f"disaggregation role {role.value!r} is not supported"
-            )
-
     def create_pipeline_stages(self, server_args: ServerArgs) -> None:
         # Per-model sigma override from model_index.json; contract tests
         # construct the pipeline without model_path, hence the guard.
@@ -149,45 +142,69 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
             if release_metadata is not None
             else None
         )
-        self.add_stage(InputValidationStage())
+        self.add_stage_factory(
+            RoleType.ENCODER,
+            InputValidationStage,
+            "InputValidationStage",
+        )
         if release_metadata is not None:
-            self.add_stage(MiniMaxH3PartitionAdmissionStage(release_metadata))
-        self.add_stage(
-            MiniMaxH3TextEncodingStage(
+            self.add_stage_factory(
+                RoleType.ENCODER,
+                lambda: MiniMaxH3PartitionAdmissionStage(release_metadata),
+                "MiniMaxH3PartitionAdmissionStage",
+            )
+        self.add_stage_factory(
+            RoleType.ENCODER,
+            lambda: MiniMaxH3TextEncodingStage(
                 text_encoder=self.get_module("text_encoder"),
                 tokenizer=self.get_module("tokenizer"),
                 processor=self.get_module("processor"),
-            )
+            ),
+            "MiniMaxH3TextEncodingStage",
         )
-        self.add_stage(
-            MiniMaxH3VisualEncodingStage(
+        self.add_stage_factory(
+            RoleType.ENCODER,
+            lambda: MiniMaxH3VisualEncodingStage(
                 video_vae=self.get_module("video_vae"),
                 vae_arch_config=server_args.pipeline_config.vae_config.arch_config,
-            )
+            ),
+            "MiniMaxH3VisualEncodingStage",
         )
-        self.add_stage(
-            MiniMaxH3AudioEncodingStage(
+        self.add_stage_factory(
+            RoleType.ENCODER,
+            lambda: MiniMaxH3AudioEncodingStage(
                 audio_vae=self.get_module("audio_vae"),
                 vae_arch_config=server_args.pipeline_config.audio_vae_config.arch_config,
-            )
+            ),
+            "MiniMaxH3AudioEncodingStage",
         )
-        self.add_stage(MiniMaxH3LatentPreparationStage())
-        self.add_stage(
-            MiniMaxH3TimestepPreparationStage(
+        self.add_stage_factory(
+            RoleType.ENCODER,
+            MiniMaxH3LatentPreparationStage,
+            "MiniMaxH3LatentPreparationStage",
+        )
+        self.add_stage_factory(
+            RoleType.ENCODER,
+            lambda: MiniMaxH3TimestepPreparationStage(
                 sigma_shift_scales=sigma_shift_scales,
-            )
+            ),
+            "MiniMaxH3TimestepPreparationStage",
         )
-        self.add_stage(
-            MiniMaxH3DenoisingStage(
+        self.add_stage_factory(
+            RoleType.DENOISER,
+            lambda: MiniMaxH3DenoisingStage(
                 transformer=self.get_module("transformer"),
                 pipeline=self,
-            )
+            ),
+            "MiniMaxH3DenoisingStage",
         )
-        self.add_stage(
-            MiniMaxH3DecodingStage(
+        self.add_stage_factory(
+            RoleType.DECODER,
+            lambda: MiniMaxH3DecodingStage(
                 video_vae=self.get_module("video_vae"),
                 audio_vae=self.get_module("audio_vae"),
-            )
+            ),
+            "MiniMaxH3DecodingStage",
         )
 
 
