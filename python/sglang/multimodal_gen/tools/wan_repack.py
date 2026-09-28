@@ -95,7 +95,77 @@ def get_quant_subpath(
         return quant_path / sub
     return quant_path
 
+from transformers import UMT5Config, T5Tokenizer
 
+
+def load_local_text_encoder(model_dir):
+    config = UMT5Config(
+        vocab_size=256384,
+        d_model=4096,
+        d_kv=64,
+        d_ff=10240,
+        num_layers=24,
+        num_decoder_layers=24,
+        num_heads=64,
+        relative_attention_num_buckets=32,
+        relative_attention_max_distance=128,
+        dropout_rate=0.1,
+        layer_norm_epsilon=1e-6,
+        feed_forward_proj="gated-gelu",
+        tie_word_embeddings=False,
+        pad_token_id=0,
+        eos_token_id=1,
+        decoder_start_token_id=0,
+        scalable_attention=True,
+    )
+
+    source = torch.load(
+        model_dir / "models_t5_umt5-xxl-enc-bf16.pth",
+        map_location="cpu",
+        weights_only=True,
+        mmap=True,
+    )
+
+    converted = {}
+    embedding = source.pop("token_embedding.weight")
+    converted["shared.weight"] = embedding
+    converted["encoder.embed_tokens.weight"] = embedding
+    converted["encoder.final_layer_norm.weight"] = source.pop("norm.weight")
+
+    suffix_mapping = {
+        "norm1.weight": "layer.0.layer_norm.weight",
+        "attn.q.weight": "layer.0.SelfAttention.q.weight",
+        "attn.k.weight": "layer.0.SelfAttention.k.weight",
+        "attn.v.weight": "layer.0.SelfAttention.v.weight",
+        "attn.o.weight": "layer.0.SelfAttention.o.weight",
+        "pos_embedding.embedding.weight":
+            "layer.0.SelfAttention.relative_attention_bias.weight",
+        "norm2.weight": "layer.1.layer_norm.weight",
+        "ffn.gate.0.weight": "layer.1.DenseReluDense.wi_0.weight",
+        "ffn.fc1.weight": "layer.1.DenseReluDense.wi_1.weight",
+        "ffn.fc2.weight": "layer.1.DenseReluDense.wo.weight",
+    }
+
+    for key, value in source.items():
+        parts = key.split(".", 2)
+        if len(parts) != 3 or parts[0] != "blocks":
+            raise ValueError(f"Unexpected Wan text-encoder key: {key}")
+
+        _, layer, suffix = parts
+        if suffix not in suffix_mapping:
+            raise ValueError(f"Unexpected Wan text-encoder key: {key}")
+
+        target = f"encoder.block.{layer}.{suffix_mapping[suffix]}"
+        converted[target] = value
+
+    with init_empty_weights():
+        encoder = UMT5EncoderModel(config)
+
+    encoder.load_state_dict(converted, strict=True, assign=True)
+    encoder.tie_weights()
+    encoder.eval()
+    return encoder
+    
 def update_dict_(d: Dict[str, Any], old_key: str, new_key: str) -> None:
     d[new_key] = d.pop(old_key)
 
