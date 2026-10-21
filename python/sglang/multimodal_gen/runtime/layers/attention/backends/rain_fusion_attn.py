@@ -1,6 +1,7 @@
 import math
 from dataclasses import dataclass
-from typing import Any
+from itertools import pairwise
+from typing import Any, Optional
 
 import torch
 
@@ -17,7 +18,6 @@ from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
-from sglang.multimodal_gen.runtime.platforms.npu import NPUPlatformEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -56,6 +56,7 @@ class RainFusionAttentionMetadata(AttentionMetadata):
     skip_first_steps: int
     sparsity: float
     latent_shape: list[int]
+    video_spans: list[dict[str, Any]] | None = None
 
 
 class RainFusionAttentionMetadataBuilder(AttentionMetadataBuilder):
@@ -66,6 +67,7 @@ class RainFusionAttentionMetadataBuilder(AttentionMetadataBuilder):
         sparsity: float,
         raw_latent_shape: list[int],
         patch_size: tuple[int, int, int],
+        video_spans: Optional[list[dict[str, Any]]] = None,
         **kwargs: dict[str, Any],
     ) -> RainFusionAttentionMetadata:
         if not (skip_first_steps >= 0 and 0.0 <= sparsity < 1.0):
@@ -88,11 +90,26 @@ class RainFusionAttentionMetadataBuilder(AttentionMetadataBuilder):
         latent_shape = raw_latent_shape[-3:]
         latent_shape = [latent_shape[i] // patch_size[i] for i in range(3)]
 
+        previous_end = 0
+        for span in video_spans or []:
+            start, shape = span["start"], span["latent_shape"]
+            if (
+                not isinstance(start, int)
+                or start < previous_end
+                or len(shape) != 3
+                or any(not isinstance(dim, int) or dim <= 0 for dim in shape)
+            ):
+                raise ValueError(
+                    "video_spans must be ordered, nonoverlapping [T, H, W] grids"
+                )
+            previous_end = start + math.prod(shape)
+
         return RainFusionAttentionMetadata(
             current_timestep=current_timestep,
             skip_first_steps=skip_first_steps,
             sparsity=sparsity,
             latent_shape=latent_shape,
+            video_spans=video_spans,
         )
 
 
@@ -107,10 +124,15 @@ class RainFusionAttentionImpl(AttentionImpl):
         prefix: str = "",
         **extra_impl_args,
     ) -> None:
+        from sglang.multimodal_gen.runtime.platforms.npu import NPUPlatformEnum
+
         if causal:
             raise ValueError("Rain Fusion Attention does not support causal masks")
 
         self.softmax_scale = softmax_scale
+        # H3 normally precomputes text refinement without DiT metadata. Its
+        # _embed fallback runs inside DiT forward and must not use that video layout.
+        self._is_text_refiner = "token_refiner" in prefix.split(".")
         self.block_size = 128
         self.tile_size = RAIN_FUSION_TILE_SIZE
         self._is_a5 = current_platform.return_platform() == NPUPlatformEnum.ASCEND_950
@@ -313,7 +335,6 @@ class RainFusionAttentionImpl(AttentionImpl):
         block_sparse_mask: torch.Tensor,
     ) -> torch.Tensor:
         """CANN block sparse attention with BSND input and output."""
-        # TODO A5 supports BSND layout.
         actual_seq_lengths = [query.shape[1]] * query.shape[0]
         actual_seq_lengths_kv = [key.shape[1]] * key.shape[0]
 
@@ -336,6 +357,53 @@ class RainFusionAttentionImpl(AttentionImpl):
         )
         return output[..., :head_dim].permute(0, 2, 1, 3).contiguous()
 
+    def _prepare_sparse_attention(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        latent_shape: tuple[int, int, int],
+        sparsity: float,
+        video_spans: list[dict[str, Any]] | None = None,
+    ) -> tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None
+    ]:
+        if video_spans == []:
+            block_count = math.ceil(query.shape[1] / self.block_size)
+            mask = query.new_ones(
+                (query.shape[0], query.shape[2], block_count, block_count),
+                dtype=torch.int8,
+            )
+            return query, key, value, mask, None
+        inverse = None
+        if video_spans is not None:
+            q, k, v, qkv_pool, inverse, retained = (
+                self._do_multi_span_tensor_rearrange_pooling(
+                    query, key, value, video_spans
+                )
+            )
+            query_pool, key_pool, _ = torch.chunk(qkv_pool, 3, dim=0)
+            mask = self._get_blockwise_mask_from_pools(
+                query_pool,
+                key_pool,
+                sparsity,
+                self.softmax_scale,
+                self.block_size,
+                None,
+            )
+            if retained:
+                indices = torch.tensor(sorted(retained), device=mask.device)
+                mask[:, :, indices, :] = 1
+                mask[:, :, :, indices] = 1
+        else:
+            q, k, v, qkv_pool = self._do_tensor_rearrange_pooling(
+                query, key, value, self.block_size, latent_shape
+            )
+            mask = self._get_blockwise_mask(
+                qkv_pool, sparsity, self.softmax_scale, self.block_size, latent_shape
+            )
+        return q, k, v, mask, inverse
+
     def _rain_fusion_sparse_attention(
         self,
         query: torch.Tensor,
@@ -343,16 +411,17 @@ class RainFusionAttentionImpl(AttentionImpl):
         value: torch.Tensor,
         latent_shape: tuple[int, int, int],
         sparsity: float,
+        video_spans: list[dict[str, Any]] | None = None,
     ) -> torch.Tensor:
-        q, k, v, qkv_pool = self._do_tensor_rearrange_pooling(
-            query, key, value, self.block_size, latent_shape
-        )
-        mask = self._get_blockwise_mask(
-            qkv_pool, sparsity, self.softmax_scale, self.block_size, latent_shape
+        if video_spans == []:
+            return self.dense_attn_impl.forward(query, key, value, None)
+        q, k, v, mask, inverse = self._prepare_sparse_attention(
+            query, key, value, latent_shape, sparsity, video_spans
         )
         out = self._rain_fusion_attention(q, k, v, mask)
-        out = self._inv_rearrange_with_remaining(out, latent_shape)
-        return out
+        if inverse is not None:
+            return out.index_select(1, inverse)
+        return self._inv_rearrange_with_remaining(out, latent_shape)
 
     def forward(
         self,
@@ -370,63 +439,90 @@ class RainFusionAttentionImpl(AttentionImpl):
             value,
             attn_metadata.latent_shape,
             attn_metadata.sparsity,
+            attn_metadata.video_spans,
         )
 
-    def _build_varlen_sparse_mask(
+    def _video_span_permutation(
+        self, query: torch.Tensor, video_spans: list[dict[str, Any]]
+    ) -> tuple[torch.Tensor, torch.Tensor, set[int]]:
+        """Match MindIE-SD's block-aligned multi-video packing."""
+        positions = torch.arange(query.shape[1], device=query.device)
+        dense_parts = []
+        previous_end = 0
+        for span in video_spans:
+            start = span["start"]
+            end = start + math.prod(span["latent_shape"])
+            if start < previous_end or end > query.shape[1]:
+                raise ValueError("video_spans must be ordered and within the sequence")
+            dense_parts.append(positions[previous_end:start])
+            previous_end = end
+        dense_parts.append(positions[previous_end:])
+        dense_indices = torch.cat(dense_parts)
+
+        parts = []
+        retained: set[int] = set()
+        position = dense_cursor = 0
+        for index, span in enumerate(video_spans):
+            start, shape = span["start"], span["latent_shape"]
+            length = math.prod(shape)
+            clip_block = position // self.block_size
+            retained.update(
+                range(
+                    clip_block,
+                    clip_block + math.ceil(shape[1] * shape[2] / self.block_size),
+                )
+            )
+            parts.append(
+                self._rearrange_with_remaining(
+                    positions[start : start + length].reshape(1, -1, 1, 1), shape
+                ).reshape(-1)
+            )
+            position += length
+            if index != len(video_spans) - 1 and position % self.block_size:
+                needed = -position % self.block_size
+                if dense_cursor + needed > dense_indices.numel():
+                    raise ValueError(
+                        "Rain Fusion needs dense context rows to align video spans; "
+                        "use dense attention for this layout"
+                    )
+                retained.add(position // self.block_size)
+                parts.append(dense_indices[dense_cursor : dense_cursor + needed])
+                dense_cursor += needed
+                position += needed
+
+        if dense_cursor < dense_indices.numel():
+            retained.update(
+                range(
+                    position // self.block_size,
+                    math.ceil(query.shape[1] / self.block_size),
+                )
+            )
+            parts.append(dense_indices[dense_cursor:])
+        permutation = torch.cat(parts)
+        inverse = torch.empty_like(permutation)
+        inverse[permutation] = positions
+        return permutation, inverse, retained
+
+    def _do_multi_span_tensor_rearrange_pooling(
         self,
         query: torch.Tensor,
         key: torch.Tensor,
-        boundaries: tuple[int, ...],
-        max_seqlen: int,
-        sparsity: float,
-    ) -> tuple[torch.Tensor, list[int]]:
-        segment_lengths = [
-            stop - start
-            for start, stop in zip(boundaries[:-1], boundaries[1:])
-            if stop > start
-        ]
-        if not segment_lengths:
-            return query.new_empty((0, query.shape[1], 0, 0), dtype=torch.int8), []
-
-        actual_max_seqlen = max(segment_lengths)
-        if max_seqlen < actual_max_seqlen:
+        value: torch.Tensor,
+        video_spans: list[dict[str, Any]],
+    ) -> tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, set[int]
+    ]:
+        if query.shape != key.shape or key.shape != value.shape:
             raise ValueError(
-                f"max_seqlen={max_seqlen} is smaller than the longest packed "
-                f"sequence ({actual_max_seqlen})"
+                "Rain Fusion multi-span self-attention requires equal Q/K/V shapes"
             )
-        max_block_count = math.ceil(actual_max_seqlen / self.block_size)
-
-        masks = []
-        for start, stop in zip(boundaries[:-1], boundaries[1:]):
-            if stop == start:
-                continue
-            query_pool = self._avgpool(query[start:stop].unsqueeze(0))
-            key_pool = self._avgpool(key[start:stop].unsqueeze(0))
-            mask = self._get_blockwise_mask_from_pools(
-                query_pool,
-                key_pool,
-                sparsity,
-                self.softmax_scale,
-                self.block_size,
-                None,
-            )
-            block_count = mask.shape[-1]
-            masks.append(
-                torch.nn.functional.pad(
-                    mask,
-                    (
-                        0,
-                        max_block_count - block_count,
-                        0,
-                        max_block_count - block_count,
-                    ),
-                )
-            )
-
-        # npu_block_sparse_attention validates sum(actual_seq_lengths) == T: it
-        # takes per-batch lengths, not the cumulative TND offsets that
-        # npu_fused_infer_attention_score takes.
-        return torch.cat(masks, dim=0), segment_lengths
+        permutation, inverse, retained = self._video_span_permutation(
+            query, video_spans
+        )
+        tensor = torch.cat((query, key, value), dim=0).index_select(1, permutation)
+        tensor_pool = self._avgpool(tensor, self.block_size)
+        q, k, v = torch.chunk(tensor, 3, dim=0)
+        return q, k, v, tensor_pool, inverse, retained
 
     def _rain_fusion_sparse_attention_varlen(
         self,
@@ -437,31 +533,80 @@ class RainFusionAttentionImpl(AttentionImpl):
         boundaries: tuple[int, ...],
         max_seqlen: int,
         sparsity: float,
+        latent_shape: tuple[int, int, int],
+        video_spans: list[dict[str, Any]] | None = None,
     ) -> torch.Tensor:
-        block_sparse_mask, actual_seq_lengths = self._build_varlen_sparse_mask(
-            query, key, boundaries, max_seqlen, sparsity
-        )
-        if not actual_seq_lengths:
+        segments = [(a, b) for a, b in pairwise(boundaries) if b > a]
+        if not segments:
             return torch.empty_like(query)
+        lengths = [b - a for a, b in segments]
+
+        block_count = math.ceil(max(lengths) / self.block_size)
+        queries, keys, values, masks, layouts = [], [], [], [], []
+        for start, stop in segments:
+            local_spans = (
+                None
+                if video_spans is None
+                else [
+                    {
+                        "start": span["start"] - start,
+                        "latent_shape": span["latent_shape"],
+                    }
+                    for span in video_spans
+                    if start <= span["start"] < stop
+                ]
+            )
+            q, k, v, mask, inverse = self._prepare_sparse_attention(
+                query[start:stop].unsqueeze(0),
+                key[start:stop].unsqueeze(0),
+                value[start:stop].unsqueeze(0),
+                latent_shape,
+                sparsity,
+                local_spans,
+            )
+            queries.append(q[0])
+            keys.append(k[0])
+            values.append(v[0])
+            masks.append(
+                torch.nn.functional.pad(
+                    mask,
+                    (0, block_count - mask.shape[-1], 0, block_count - mask.shape[-2]),
+                )
+            )
+            layouts.append((inverse, local_spans))
 
         head_dim = query.shape[-1]
-        query, key, value = self._pad_head_dim(query, key, value)
+        q, k, v = self._pad_head_dim(
+            torch.cat(queries), torch.cat(keys), torch.cat(values)
+        )
+        # BSA takes segment lengths, not cumulative cu_seqlens offsets.
         output, _ = torch.ops.npu.npu_block_sparse_attention(
-            query.contiguous(),
-            key.contiguous(),
-            value.contiguous(),
-            block_sparse_mask,
+            q.contiguous(),
+            k.contiguous(),
+            v.contiguous(),
+            torch.cat(masks),
             [self.block_size, self.block_size],
             q_input_layout="TND",
             kv_input_layout="TND",
-            num_key_value_heads=key.shape[1],
+            num_key_value_heads=k.shape[1],
             scale_value=self.softmax_scale,
             inner_precise=self.inner_precise,
-            actual_seq_lengths=actual_seq_lengths,
-            actual_seq_lengths_kv=actual_seq_lengths,
+            actual_seq_lengths=lengths,
+            actual_seq_lengths_kv=lengths,
             softmax_lse_flag=0,
         )
-        return output[..., :head_dim].contiguous()
+        output = output[..., :head_dim]
+        outputs = []
+        for (start, stop), (inverse, local_spans) in zip(segments, layouts):
+            segment = output[start:stop]
+            if inverse is not None:
+                segment = segment.index_select(0, inverse)
+            elif local_spans is None:
+                segment = self._inv_rearrange_with_remaining(
+                    segment[None], latent_shape
+                )[0]
+            outputs.append(segment)
+        return torch.cat(outputs).contiguous()
 
     def forward_varlen(
         self,
@@ -497,7 +642,11 @@ class RainFusionAttentionImpl(AttentionImpl):
 
         # Refiner attention can run before the denoising forward context exists.
         context = get_forward_context_or_none()
-        attn_metadata = context.attn_metadata if context is not None else None
+        attn_metadata = (
+            context.attn_metadata
+            if context is not None and not self._is_text_refiner
+            else None
+        )
         if attn_metadata is not None and not isinstance(
             attn_metadata, RainFusionAttentionMetadata
         ):
@@ -524,4 +673,6 @@ class RainFusionAttentionImpl(AttentionImpl):
             boundaries=boundaries,
             max_seqlen=max_seqlen,
             sparsity=attn_metadata.sparsity,
+            latent_shape=attn_metadata.latent_shape,
+            video_spans=attn_metadata.video_spans,
         )

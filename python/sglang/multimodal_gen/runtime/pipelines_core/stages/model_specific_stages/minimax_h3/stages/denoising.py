@@ -16,6 +16,9 @@ from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
     CacheDitConfig,
     disable_cache_on_transformer,
 )
+from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
+    AttentionMetadata,
+)
 from sglang.multimodal_gen.runtime.layers.attention.backends.cube_sparse_attn import (
     CubeSparseAttentionMetadata,
     CubeSparseAttentionMetadataBuilder,
@@ -381,6 +384,31 @@ def _build_cube_attn_metadata(
     )
     return metadata
 
+def _build_rain_fusion_attn_metadata(
+    server_args: ServerArgs, *, packed: dict[str, Any]
+) -> AttentionMetadata | None:
+    # H3's custom loop bypasses DenoisingStage._build_attn_metadata. This object
+    # reaches attention through _forward_dit's ForwardContext, not model kwargs.
+    transformer_backend = (server_args.component_attention_backends or {}).get(
+        "transformer", server_args.attention_backend
+    )
+    if str(transformer_backend).lower() != "rain_fusion_attn":
+        return None
+
+    from sglang.multimodal_gen.runtime.layers.attention.backends.rain_fusion_attn import (
+        RainFusionAttentionMetadataBuilder,
+    )
+
+    config = server_args.attention_backend_config or {}
+    return RainFusionAttentionMetadataBuilder().build(
+        current_timestep=0,
+        skip_first_steps=config.get("skip_first_steps", 10),
+        sparsity=config.get("sparsity", 0.7),
+        raw_latent_shape=packed["stream_layout"]["target_shape"],
+        patch_size=(1, 1, 1),
+        video_spans=packed["video_spans"],
+    )
+
 
 def _precompute_refined_prompt_embeds(
     model: Any,
@@ -734,6 +762,8 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             num_steps=len(sigmas_video) - 1,
             device=device,
         )
+        if attn_metadata is None:
+            attn_metadata = _build_rain_fusion_attn_metadata(server_args, packed=packed)
 
         placement_managed = self._component_residency_manager is not None
         if placement_managed:
@@ -898,7 +928,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         step_index: int,
         *,
         batch: Req,
-        attn_metadata: CubeSparseAttentionMetadata | None = None,
+        attn_metadata: AttentionMetadata | None = None,
         build_vsa_h3_step_metadata: Callable[[int], Any] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Route the custom full loop through the native denoising runner."""
