@@ -2,6 +2,7 @@ import math
 from dataclasses import dataclass
 from itertools import pairwise
 from typing import Any, Optional
+from mindiesd import sparse_attention
 
 import torch
 
@@ -433,7 +434,22 @@ class RainFusionAttentionImpl(AttentionImpl):
         if attn_metadata.current_timestep < attn_metadata.skip_first_steps:
             return self.dense_attn_impl.forward(query, key, value, attn_metadata)
 
-        return self._rain_fusion_sparse_attention(
+        # mindiesd_out = sparse_attention(
+        #     query,
+        #     key,
+        #     value,
+        #     scale=self.softmax_scale,
+        #     head_num=query.shape[2],
+        #     input_layout="BSND",
+        #     sparse_type="rf_v3",
+        #     block_size=self.block_size,
+        #     latent_shape_q=attn_metadata.latent_shape,
+        #     latent_shape_k=attn_metadata.latent_shape,
+        #     video_spans=attn_metadata.video_spans,
+        #     sparsity=attn_metadata.sparsity,
+        #     precision="bf16",
+        # )
+        sglang_out =  self._rain_fusion_sparse_attention(
             query,
             key,
             value,
@@ -441,6 +457,8 @@ class RainFusionAttentionImpl(AttentionImpl):
             attn_metadata.sparsity,
             attn_metadata.video_spans,
         )
+        # print(f"Max diff: {(sglang_out - mindiesd_out).abs().max()=}")
+        return sglang_out
 
     def _video_span_permutation(
         self, query: torch.Tensor, video_spans: list[dict[str, Any]]
@@ -644,18 +662,16 @@ class RainFusionAttentionImpl(AttentionImpl):
         context = get_forward_context_or_none()
         attn_metadata = (
             context.attn_metadata
-            if context is not None and not self._is_text_refiner
+            if context is not None 
             else None
         )
-        if attn_metadata is not None and not isinstance(
-            attn_metadata, RainFusionAttentionMetadata
-        ):
+        if not (isinstance(attn_metadata, RainFusionAttentionMetadata) or self._is_text_refiner):
             raise ValueError(
                 "Rain Fusion requires RainFusionAttentionMetadata "
                 "in the active forward context"
             )
         if (
-            attn_metadata is None
+            not attn_metadata
             or attn_metadata.current_timestep < attn_metadata.skip_first_steps
         ):
             return self.dense_attn_impl.forward_varlen(
@@ -666,13 +682,72 @@ class RainFusionAttentionImpl(AttentionImpl):
                 max_seqlen=max_seqlen,
                 cu_seqlens_host=boundaries,
             )
-        return self._rain_fusion_sparse_attention_varlen(
-            query,
-            key,
-            value,
-            boundaries=boundaries,
-            max_seqlen=max_seqlen,
-            sparsity=attn_metadata.sparsity,
-            latent_shape=attn_metadata.latent_shape,
-            video_spans=attn_metadata.video_spans,
-        )
+
+        mindiesd_out = []
+        for start, stop in pairwise(boundaries):
+            if start == stop:
+                continue
+            local_spans = (
+                None
+                if attn_metadata.video_spans is None
+                else [
+                    {
+                        "start": span["start"] - start,
+                        "latent_shape": span["latent_shape"],
+                    }
+                    for span in attn_metadata.video_spans
+                    if start <= span["start"] < stop
+                ]
+            )
+            # MindIE-SD rejects empty spans. Such segments contain only dense
+            # context/padding and must not use the global video geometry.
+            sparse_kwargs = {"sparse_type": "rf_v3"}
+            if local_spans is None:
+                if stop - start != math.prod(attn_metadata.latent_shape):
+                    raise ValueError(
+                        f"MindIE-SD segment [{start}, {stop}) does not match "
+                        f"latent_shape={attn_metadata.latent_shape}; provide "
+                        "video_spans for mixed or padded sequences"
+                    )
+                sparse_kwargs.update(
+                    latent_shape_q=attn_metadata.latent_shape,
+                    latent_shape_k=attn_metadata.latent_shape,
+                )
+            elif local_spans:
+                sparse_kwargs["video_spans"] = local_spans
+            else:
+                sparse_kwargs["sparse_type"] = None
+
+            q, k, v = self._pad_head_dim(
+                query[start:stop].unsqueeze(0),
+                key[start:stop].unsqueeze(0),
+                value[start:stop].unsqueeze(0),
+            )
+            segment = sparse_attention(
+                q,
+                k,
+                v,
+                scale=self.softmax_scale,
+                head_num=query.shape[1],
+                input_layout="BSND",
+                inner_precise=self.inner_precise,
+                block_size=self.block_size,
+                sparsity=attn_metadata.sparsity,
+                precision="bf16",
+                **sparse_kwargs,
+            )
+            mindiesd_out.append(segment[0, ..., : query.shape[-1]])
+        mindiesd_out = torch.cat(mindiesd_out, dim=0).contiguous()
+
+        # sglang_out = self._rain_fusion_sparse_attention_varlen(
+        #     query,
+        #     key,
+        #     value,
+        #     boundaries=boundaries,
+        #     max_seqlen=max_seqlen,
+        #     sparsity=attn_metadata.sparsity,
+        #     latent_shape=attn_metadata.latent_shape,
+        #     video_spans=attn_metadata.video_spans,
+        # )
+        #print(f"Max diff: {(sglang_out - mindiesd_out).abs().max()=}")
+        return mindiesd_out
