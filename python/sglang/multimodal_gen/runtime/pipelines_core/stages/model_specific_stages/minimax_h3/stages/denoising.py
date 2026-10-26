@@ -399,6 +399,7 @@ def _build_rain_fusion_attn_metadata(
     )
 
     config = server_args.attention_backend_config or {}
+    # current_timestep will be assigned in the loop
     return RainFusionAttentionMetadataBuilder().build(
         current_timestep=0,
         skip_first_steps=config.get("skip_first_steps", 10),
@@ -761,6 +762,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             num_steps=len(sigmas_video) - 1,
             device=device,
         )
+
         placement_managed = self._component_residency_manager is not None
         if placement_managed:
             self._manage_dit_use_site(self.transformer, "transformer", batch)

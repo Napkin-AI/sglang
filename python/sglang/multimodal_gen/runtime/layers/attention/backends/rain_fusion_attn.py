@@ -448,21 +448,6 @@ class RainFusionAttentionImpl(AttentionImpl):
         if attn_metadata.current_timestep < attn_metadata.skip_first_steps:
             return self.dense_attn_impl.forward(query, key, value, attn_metadata)
 
-        # mindiesd_out = sparse_attention(
-        #     query,
-        #     key,
-        #     value,
-        #     scale=self.softmax_scale,
-        #     head_num=query.shape[2],
-        #     input_layout="BSND",
-        #     sparse_type="rf_v3",
-        #     block_size=self.block_size,
-        #     latent_shape_q=attn_metadata.latent_shape,
-        #     latent_shape_k=attn_metadata.latent_shape,
-        #     video_spans=attn_metadata.video_spans,
-        #     sparsity=attn_metadata.sparsity,
-        #     precision="bf16",
-        # )
         sglang_out = self._rain_fusion_sparse_attention(
             query,
             key,
@@ -471,7 +456,6 @@ class RainFusionAttentionImpl(AttentionImpl):
             attn_metadata.sparsity,
             attn_metadata.video_spans,
         )
-        # print(f"Max diff: {(sglang_out - mindiesd_out).abs().max()=}")
         return sglang_out
 
     def _video_span_permutation(
@@ -494,7 +478,6 @@ class RainFusionAttentionImpl(AttentionImpl):
         tile_size: int,
         video_spans: tuple[tuple[int, tuple[int, int, int]], ...],
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # Shared across layers; cache only indices, never Q/K/V or masks.
         positions = torch.arange(sequence_length, device=device)
         dense_parts = []
         previous_end = 0
@@ -785,9 +768,6 @@ class RainFusionAttentionImpl(AttentionImpl):
                 max_seqlen=max_seqlen,
                 cu_seqlens_host=boundaries,
             )
-        if query.shape[0] == 0:
-            return torch.empty_like(query)
-
         return self._rain_fusion_sparse_attention_varlen(
             query,
             key,
