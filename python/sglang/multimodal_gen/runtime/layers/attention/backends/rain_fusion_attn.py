@@ -28,6 +28,8 @@ RAIN_FUSION_TILE_SIZE = 8
 
 
 class RainFusionAttentionBackend(AttentionBackend):
+    """Rain Fusion attention adapted from MindIE-SD's RF-v3 implementation."""
+
     accept_output_buffer: bool = True
 
     @staticmethod
@@ -115,6 +117,8 @@ class RainFusionAttentionMetadataBuilder(AttentionMetadataBuilder):
 
 
 class RainFusionAttentionImpl(AttentionImpl):
+    """MindIE-SD RF-v3 adapted for SGLang"""
+
     def __init__(
         self,
         num_heads: int,
@@ -131,6 +135,8 @@ class RainFusionAttentionImpl(AttentionImpl):
             raise ValueError("Rain Fusion Attention does not support causal masks")
 
         self.softmax_scale = softmax_scale
+        # MiniMax-H3 declares bounds=(0, used, total), with max_seqlen=used.
+        # This flag permits skipping the padding tail and zeroing its output.
         self.packed_trailing_padding = extra_impl_args.get(
             "packed_trailing_padding", False
         )
@@ -471,8 +477,6 @@ class RainFusionAttentionImpl(AttentionImpl):
     def _video_span_permutation(
         self, query: torch.Tensor, video_spans: list[dict[str, Any]]
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Match MindIE-SD's block-aligned multi-video packing."""
-        # Snapshot values, not the identity of mutable span descriptors.
         return self._cached_video_span_permutation(
             query.device,
             query.shape[1],
