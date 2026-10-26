@@ -694,7 +694,6 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         construction, condition noise augmentation, initial-row expansion,
         the denoise loop itself, and output publication.
         """
-        logger.warning("here!")
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.denoise_loop import (
             MiniMaxH3DenoiseBranch,
             _minimax_h3_subblock_video_query_indices,
@@ -763,7 +762,6 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             device=device,
         )
         placement_managed = self._component_residency_manager is not None
-        logger.warning(f"build {placement_managed=}")
         if placement_managed:
             self._manage_dit_use_site(self.transformer, "transformer", batch)
         try:
@@ -776,7 +774,6 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                 attn_metadata = _build_rain_fusion_attn_metadata(
                     server_args, model=model, packed=packed
                 )
-            logger.warning(f"Attn metadata is None: {attn_metadata is None}") 
             build_vsa_h3_step_metadata = _maybe_prepare_vsa_h3_step_metadata(
                 model=model,
                 packed=packed,
