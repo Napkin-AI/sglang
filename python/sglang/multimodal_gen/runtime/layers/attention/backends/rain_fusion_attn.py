@@ -140,9 +140,6 @@ class RainFusionAttentionImpl(AttentionImpl):
         self.packed_trailing_padding = extra_impl_args.get(
             "packed_trailing_padding", False
         )
-        # H3 normally precomputes text refinement without DiT metadata. Its
-        # _embed fallback runs inside DiT forward and must not use that video layout.
-        self._is_text_refiner = "token_refiner" in prefix.split(".")
         self.block_size = 128
         self.tile_size = RAIN_FUSION_TILE_SIZE
         self._is_a5 = current_platform.return_platform() == NPUPlatformEnum.ASCEND_950
@@ -448,7 +445,7 @@ class RainFusionAttentionImpl(AttentionImpl):
         if attn_metadata.current_timestep < attn_metadata.skip_first_steps:
             return self.dense_attn_impl.forward(query, key, value, attn_metadata)
 
-        sglang_out = self._rain_fusion_sparse_attention(
+        return self._rain_fusion_sparse_attention(
             query,
             key,
             value,
@@ -456,7 +453,6 @@ class RainFusionAttentionImpl(AttentionImpl):
             attn_metadata.sparsity,
             attn_metadata.video_spans,
         )
-        return sglang_out
 
     def _video_span_permutation(
         self, query: torch.Tensor, video_spans: list[dict[str, Any]]
@@ -703,7 +699,6 @@ class RainFusionAttentionImpl(AttentionImpl):
         max_seqlen: int,
         cu_seqlens_host: tuple[int, ...] | None = None,
     ) -> torch.Tensor:
-        """Run packed self-attention for TND ``[total_tokens, heads, dim]`` input."""
         boundaries = (
             cu_seqlens_host
             if cu_seqlens_host is not None
@@ -713,7 +708,7 @@ class RainFusionAttentionImpl(AttentionImpl):
             len(boundaries) < 2
             or boundaries[0] != 0
             or boundaries[-1] != query.shape[0]
-            or any(stop < start for start, stop in zip(boundaries[:-1], boundaries[1:]))
+            or any(stop < start for start, stop in pairwise(boundaries))
         ):
             raise ValueError(
                 "cu_seqlens must start at 0, be non-decreasing, and end at "
@@ -725,24 +720,14 @@ class RainFusionAttentionImpl(AttentionImpl):
                 "counts and matching K/V head counts"
             )
 
-        # Refiner attention can run before the denoising forward context exists.
         context = get_forward_context_or_none()
-        attn_metadata = (
-            context.attn_metadata
-            if context is not None and not self._is_text_refiner
-            else None
-        )
-        if attn_metadata is not None and not isinstance(
-            attn_metadata, RainFusionAttentionMetadata
-        ):
+        attn_metadata = context.attn_metadata if context is not None else None
+        if not isinstance(attn_metadata, RainFusionAttentionMetadata):
             raise ValueError(
                 "Rain Fusion requires RainFusionAttentionMetadata "
                 "in the active forward context"
             )
-        if (
-            attn_metadata is None
-            or attn_metadata.current_timestep < attn_metadata.skip_first_steps
-        ):
+        if attn_metadata.current_timestep < attn_metadata.skip_first_steps:
             used = (
                 trailing_padding_used_len(query.shape[0], max_seqlen, boundaries)
                 if self.packed_trailing_padding
