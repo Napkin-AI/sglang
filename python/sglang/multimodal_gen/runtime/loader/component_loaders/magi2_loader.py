@@ -699,6 +699,11 @@ def load_magi2_modules(
     device = get_local_torch_device()
     dtypes = _resolve_magi2_dtypes(server_args)
 
+    def initial_device(component_name: str) -> torch.device:
+        if server_args.should_start_component_on_cpu(component_name):
+            return torch.device("cpu")
+        return device
+
     # The text encoder runs once per request before either DiT, and as a plain
     # transformers module sglang's layerwise offload cannot hook it. Staged in by
     # Magi2TextEncodingStage.
@@ -708,14 +713,14 @@ def load_magi2_modules(
         checkpoint_root=checkpoint_root,
         config=config.dit_config,
         ep_group=ep_group,
-        device=device,
+        device=initial_device("transformer"),
         param_dtype=dtypes["transformer"],
     )
     transformer_2 = (
         load_magi2_refiner_dit(
             checkpoint_root=checkpoint_root,
             config=config.refiner_dit_config,
-            device=device,
+            device=initial_device("transformer_2"),
             param_dtype=dtypes["transformer_2"],
         )
         if config.enable_refiner

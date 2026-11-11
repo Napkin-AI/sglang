@@ -21,7 +21,11 @@ from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     VideoGenerationsRequest,
 )
-from sglang.multimodal_gen.runtime.layers.attention import magi2_sink_attention
+from sglang.multimodal_gen.runtime.layers import moe_multihead
+from sglang.multimodal_gen.runtime.layers.attention import (
+    magi2_block_grid_attention,
+    magi2_sink_attention,
+)
 from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import SDPABackend
 from sglang.multimodal_gen.runtime.layers.attention.magi2_block_grid_attention import (
     SEQ_BUCKET,
@@ -83,8 +87,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.magi2.stages.denoising import (
     Magi2DenoisingStage,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import set_global_server_args
 from sglang.multimodal_gen.runtime.warmup_request_builder import lighten_warmup_req
+from sglang.test.test_utils import CustomTestCase
 
 
 class TestPerTokenTimesteps(unittest.TestCase):
@@ -907,6 +913,213 @@ class TestHeadChunking(unittest.TestCase):
             )
 
 
+class TestMagi2NpuExperts(CustomTestCase):
+    @staticmethod
+    def _inputs():
+        generator = torch.Generator().manual_seed(17)
+        experts = (
+            Magi2MultiHeadExperts(
+                num_heads=3, num_experts_per_head=4, head_dim=16, intermediate_size=32
+            )
+            .to(torch.bfloat16)
+            .requires_grad_(False)
+        )
+        with torch.no_grad():
+            for weight in experts.parameters():
+                weight.copy_(torch.randn(weight.shape, generator=generator) * 0.5)
+        tokens = (torch.randn(13, 16, generator=generator) * 3).to(torch.bfloat16)
+        # Rank-local, head-major IDs; experts 0/2 in each head are empty.
+        ids = torch.tensor(
+            [[4 * (row % 3) + 3, 4 * (row % 3) + 1] for row in range(13)]
+        )
+        weights = torch.rand(13, 2, generator=generator) * 1.7
+        return experts, tokens, ids, weights
+
+    @staticmethod
+    def _reference(experts, tokens, ids, weights):
+        output = torch.zeros_like(tokens, dtype=torch.float32)
+        for row in range(tokens.shape[0]):
+            for slot in range(ids.shape[1]):
+                expert = int(ids[row, slot])
+                projected = (
+                    F.linear(tokens[row].float(), experts.w13_weight[expert].float())
+                    .to(torch.bfloat16)
+                    .float()
+                )
+                gate = projected[::2].clamp(max=7.0)
+                up = projected[1::2].clamp(-7.0, 7.0)
+                activated = (gate * torch.sigmoid(1.702 * gate) * (up + 1)).to(
+                    torch.bfloat16
+                )
+                down = F.linear(activated.float(), experts.w2[expert].float()).to(
+                    torch.bfloat16
+                )
+                output[row] += down.float() * weights[row, slot]
+        return output.to(tokens.dtype)
+
+    @staticmethod
+    def _routing(x, ids, **kwargs):
+        assert kwargs["row_idx_type"] == 0
+        assert kwargs["expert_tokens_num_type"] == 0
+        assert kwargs["drop_pad_mode"] == 0 and kwargs["quant_mode"] == -1
+        assert kwargs["active_num"] == ids.numel()
+        assert kwargs["active_expert_range"] == [0, kwargs["expert_num"]]
+        order = ids.flatten().argsort(stable=True)
+        inverse = torch.empty_like(order)
+        inverse[order] = torch.arange(order.numel())
+        groups = torch.bincount(ids.flatten(), minlength=kwargs["expert_num"]).cumsum(0)
+        return x[order // ids.shape[1]], inverse.int(), groups, None
+
+    @staticmethod
+    def _grouped_matmul(
+        *, x, weight, group_list, split_item, group_type, group_list_type
+    ):
+        assert (split_item, group_type, group_list_type) == (2, 0, 0)
+        boundaries = [0, *group_list.tolist()]
+        output = [
+            (x[0][start:stop].float() @ weight[0][expert].float()).to(x[0].dtype)
+            for expert, (start, stop) in enumerate(zip(boundaries[:-1], boundaries[1:]))
+        ]
+        return [torch.cat(output)]
+
+    def test_native_experts_preserve_routing_activation_and_chunk_boundaries(self):
+        """The CUDA-only align/GEMM runner must be replaced without changing MoE math."""
+        experts, tokens, ids, weights = self._inputs()
+        expected = self._reference(experts, tokens, ids, weights)
+        with (
+            mock.patch.object(moe_multihead, "_NPU_EXPERT_TOKEN_CHUNK", 4),
+            mock.patch.object(
+                torch.ops.npu, "npu_moe_init_routing_v2", self._routing, create=True
+            ),
+            mock.patch.object(
+                torch.ops.npu, "npu_grouped_matmul", self._grouped_matmul, create=True
+            ),
+        ):
+            actual = experts._run_heads_npu(
+                tokens, ids, weights, experts.w13_weight, experts.w2
+            )
+            empty = experts._run_heads_npu(
+                tokens[:0], ids[:0], weights[:0], experts.w13_weight, experts.w2
+            )
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        self.assertEqual(empty.shape, (0, 16))
+
+    @unittest.skipUnless(current_platform.is_npu(), "requires Ascend NPU")
+    def test_npu_expert_forward_matches_reference(self):
+        experts, tokens, ids, weights = self._inputs()
+        expected = self._reference(experts, tokens, ids, weights)
+        experts = experts.to("npu")
+        with (
+            mock.patch.object(moe_multihead, "_NPU_EXPERT_TOKEN_CHUNK", 4),
+            torch.no_grad(),
+        ):
+            actual = experts(tokens.to("npu"), ids.to("npu"), weights.to("npu"))
+        torch.testing.assert_close(actual.cpu(), expected, rtol=0.02, atol=0.08)
+
+
+class TestMagi2NpuBlockGrid(CustomTestCase):
+    @staticmethod
+    def _packed_attention(q, k, v, **kwargs):
+        assert kwargs["input_layout"] == "TND"
+        assert kwargs["num_heads"] == q.shape[1]
+        assert kwargs["num_key_value_heads"] == k.shape[1]
+        outputs = []
+        q_start = k_start = 0
+        for q_stop, k_stop in zip(
+            kwargs["actual_seq_lengths"], kwargs["actual_seq_lengths_kv"]
+        ):
+            outputs.append(
+                F.scaled_dot_product_attention(
+                    q[q_start:q_stop].transpose(0, 1)[None],
+                    k[k_start:k_stop].transpose(0, 1)[None],
+                    v[k_start:k_stop].transpose(0, 1)[None],
+                    scale=kwargs["scale"],
+                    enable_gqa=True,
+                )[0].transpose(0, 1)
+            )
+            q_start, k_start = q_stop, k_stop
+        return torch.cat(outputs), None
+
+    @staticmethod
+    def _inputs(grid, head_dim=16):
+        generator = torch.Generator().manual_seed(27)
+        q = torch.randn(grid.seq_len, 4, head_dim, generator=generator)
+        k, v = [
+            torch.randn(grid.seq_len, 2, head_dim, generator=generator)
+            for _ in range(2)
+        ]
+        return q, k, v
+
+    @staticmethod
+    def _reference(grid, q, k, v):
+        order, _ = block_scan_order(grid=grid, device=torch.device("cpu"))
+        allowed = _expected_allowed(grid, order)
+        allowed[:, grid.num_valid_tokens :] = False
+        return F.scaled_dot_product_attention(
+            q.transpose(0, 1)[None],
+            k.transpose(0, 1)[None],
+            v.transpose(0, 1)[None],
+            attn_mask=allowed,
+            enable_gqa=True,
+        )[0].transpose(0, 1)
+
+    def test_native_block_batches_preserve_ragged_grid_tail_padding_and_gqa(self):
+        """Packed FA must reproduce 3D neighborhoods, not a 1D window/dense mask."""
+        for tail, pad in ((0, 0), (0, 7), (5, 7)):
+            grid = Magi2BlockGrid(
+                latent_thw=(3, 5, 7),
+                block_thw=(2, 2, 2),
+                radius_thw=(1, 0, 1),
+                num_tail_tokens=tail,
+                num_pad_tokens=pad,
+            )
+            q, k, v = self._inputs(grid)
+            attention = Magi2BlockGridAttention(
+                num_heads=4, num_kv_heads=2, head_dim=16
+            )
+            expected = self._reference(grid, q, k, v)
+            magi2_block_grid_attention._npu_block_batches.cache_clear()
+            with (
+                mock.patch.object(
+                    magi2_block_grid_attention, "_NPU_MAX_BLOCKS_PER_BATCH", 3
+                ),
+                mock.patch.object(
+                    magi2_block_grid_attention, "_NPU_MAX_PACKED_KV_TOKENS", 40
+                ),
+                mock.patch.object(
+                    torch.ops.npu,
+                    "npu_fused_infer_attention_score",
+                    self._packed_attention,
+                    create=True,
+                ),
+            ):
+                actual = attention._attend_npu(q=q, k=k, v=v, grid=grid)
+            torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+        magi2_block_grid_attention._npu_block_batches.cache_clear()
+
+    @unittest.skipUnless(current_platform.is_npu(), "requires Ascend NPU")
+    def test_npu_block_grid_matches_reference(self):
+        grid = Magi2BlockGrid(
+            latent_thw=(3, 5, 7),
+            block_thw=(2, 2, 2),
+            radius_thw=(1, 0, 1),
+            num_tail_tokens=5,
+            num_pad_tokens=7,
+        )
+        q, k, v = [t.bfloat16() for t in self._inputs(grid, head_dim=128)]
+        expected = self._reference(grid, q.float(), k.float(), v.float()).bfloat16()
+        attention = Magi2BlockGridAttention(num_heads=4, num_kv_heads=2, head_dim=128)
+        with (
+            mock.patch(
+                "sglang.multimodal_gen.runtime.distributed.parallel_state.get_ulysses_parallel_world_size",
+                return_value=1,
+            ),
+            torch.no_grad(),
+        ):
+            actual = attention(q.to("npu"), k.to("npu"), v.to("npu"), grid=grid)
+        torch.testing.assert_close(actual.cpu(), expected, rtol=0.02, atol=0.01)
+
+
 class TestExpertAxisSharding(unittest.TestCase):
     def test_matches_the_checkpoint_spelling_of_every_sharded_tensor(self):
         prefix = "blocks.5.mlp"
@@ -1127,7 +1340,104 @@ class TestServerArgsValidation(unittest.TestCase):
         )
 
 
-class TestSinkAttentionBackend(unittest.TestCase):
+class TestSinkAttentionBackend(CustomTestCase):
+    @staticmethod
+    def _dense_sink_reference(q, k, v, boundaries, sinks, scale):
+        out = []
+        for start, stop in zip(boundaries[:-1], boundaries[1:]):
+            scores = torch.einsum("thd,shd->hts", q[start:stop], k[start:stop])
+            scores = scores.float() * scale
+            sink_column = sinks[:, None, None].expand(-1, stop - start, 1)
+            probs = torch.cat((scores, sink_column), dim=-1).softmax(-1)[..., :-1]
+            out.append(torch.einsum("hts,shd->thd", probs, v[start:stop].float()))
+        return torch.cat(out).to(q.dtype)
+
+    def test_ascend_lse_correction_preserves_packed_sinks_and_head_shards(self):
+        """A sink changes the denominator, including after head sharding/rebinding."""
+        generator = torch.Generator().manual_seed(42)
+        q, k, v = [torch.randn(9, 2, 8, generator=generator) for _ in range(3)]
+        boundaries = [0, 3, 3, 9]
+        cu_seqlens = torch.tensor(boundaries, dtype=torch.int32)
+        attention = Magi2SinkAttention(num_heads=8, head_dim=8, sink_token_num=1)
+
+        # Emulate only the external FA contract; the oracle below explicitly
+        # appends a zero-value sink instead of using the production correction.
+        def packed_fa(q, k, v, cu_q, cu_k, *, softmax_scale, return_softmax_lse):
+            outputs, lses = [], []
+            for start, stop in zip(cu_q.tolist()[:-1], cu_k.tolist()[1:]):
+                scores = torch.einsum("thd,shd->hts", q[start:stop], k[start:stop])
+                scores = scores * softmax_scale
+                outputs.append(
+                    torch.einsum("hts,shd->thd", scores.softmax(-1), v[start:stop])
+                )
+                lses.append(scores.logsumexp(-1))
+            out = torch.cat(outputs)
+            return (out, torch.cat(lses, dim=1)) if return_softmax_lse else out
+
+        with (
+            mock.patch.object(
+                magi2_sink_attention, "fused_infer_attention_varlen", packed_fa
+            ),
+            mock.patch.object(
+                magi2_sink_attention, "get_ulysses_parallel_world_size", return_value=4
+            ),
+        ):
+            for rank in range(4):
+                with mock.patch.object(
+                    magi2_sink_attention, "get_ulysses_parallel_rank", return_value=rank
+                ):
+                    for logits in (
+                        [-1000.0, 1000.0, -2.0, 3.0, 1.0, 5.0, 7.0, -4.0],
+                        [2.0, -3.0, 4.0, 1.0, -5.0, 0.0, 3.0, 8.0],
+                    ):
+                        attention.sinks = nn.Parameter(torch.tensor([logits]))
+                        expected = self._dense_sink_reference(
+                            q,
+                            k,
+                            v,
+                            boundaries,
+                            torch.tensor(logits[rank * 2 : (rank + 1) * 2]),
+                            attention.softmax_scale,
+                        )
+                        actual = attention._forward_npu(q, k, v, cu_seqlens=cu_seqlens)
+                        torch.testing.assert_close(actual, expected)
+
+    def test_ascend_does_not_silently_drop_a_window(self):
+        attention = Magi2SinkAttention(num_heads=2, head_dim=8, window_size=(2, 2))
+        q = torch.zeros(3, 2, 8)
+        with self.assertRaisesRegex(NotImplementedError, "only full attention"):
+            attention._forward_npu(q, q, q, cu_seqlens=torch.tensor([0, 3]))
+
+    @unittest.skipUnless(current_platform.is_npu(), "requires Ascend NPU")
+    def test_ascend_operator_matches_explicit_sink(self):
+        """Checks the actual packed TND/LSE contract and NPU forward dispatch."""
+        generator = torch.Generator().manual_seed(42)
+        q, k, v = [
+            torch.randn(79, 6, 128, generator=generator).to(torch.bfloat16)
+            for _ in range(3)
+        ]
+        boundaries = [0, 32, 32, 79]
+        sinks = torch.tensor([-1000.0, -3.0, 0.0, 2.0, 7.0, 1000.0])
+        attention = Magi2SinkAttention(num_heads=6, head_dim=128, sink_token_num=1)
+        attention.sinks = nn.Parameter(sinks[None].to("npu"))
+        expected = self._dense_sink_reference(
+            q.float(), k.float(), v.float(), boundaries, sinks, attention.softmax_scale
+        ).to(q.dtype)
+        with (
+            mock.patch.object(
+                magi2_sink_attention, "get_ulysses_parallel_world_size", return_value=1
+            ),
+            torch.no_grad(),
+        ):
+            actual = attention(
+                q.to("npu"),
+                k.to("npu"),
+                v.to("npu"),
+                cu_seqlens=torch.tensor(boundaries, dtype=torch.int32, device="npu"),
+                max_seqlen=47,
+            )
+        torch.testing.assert_close(actual.cpu(), expected, atol=0.01, rtol=0.02)
+
     def test_a_backend_that_drops_sinks_raises(self):
         """The FA resolver can fall back to SDPA, which ignores sinks and window."""
         attention = Magi2SinkAttention(num_heads=4, head_dim=64, sink_token_num=1)
@@ -1145,7 +1455,7 @@ class TestSinkAttentionBackend(unittest.TestCase):
                 attention._ensure_impl(torch.bfloat16)
 
 
-class TestLoaderPrecision(unittest.TestCase):
+class TestLoaderPrecision(CustomTestCase):
     _LOADERS = {
         "load_magi2_preview_dit": "transformer",
         "load_magi2_refiner_dit": "transformer_2",
@@ -1159,6 +1469,7 @@ class TestLoaderPrecision(unittest.TestCase):
         server_args = SimpleNamespace(
             pipeline_config=Magi2PipelineConfig(),
             component_precisions=component_precisions,
+            should_start_component_on_cpu=lambda name: False,
         )
         seen = {}
 
@@ -1187,6 +1498,46 @@ class TestLoaderPrecision(unittest.TestCase):
                 ep_group=None,
             )
         return seen
+
+    def test_dits_start_on_cpu_when_offloaded(self):
+        """Offloading after loading both DiTs on the accelerator can already OOM."""
+        for offloaded in (set(), {"transformer"}, {"transformer", "transformer_2"}):
+            with self.subTest(offloaded=offloaded), contextlib.ExitStack() as stack:
+                server_args = SimpleNamespace(
+                    pipeline_config=Magi2PipelineConfig(),
+                    component_precisions={},
+                    should_start_component_on_cpu=lambda name: name in offloaded,
+                )
+
+                def load_module(**kwargs):
+                    return nn.Linear(1, 1, device=kwargs["device"])
+
+                for loader, component in self._LOADERS.items():
+                    load = (
+                        (lambda **kwargs: (load_module(**kwargs), object()))
+                        if component == "text_encoder"
+                        else load_module
+                    )
+                    stack.enter_context(mock.patch.object(magi2_loader, loader, load))
+                stack.enter_context(
+                    mock.patch.object(
+                        magi2_loader,
+                        "get_local_torch_device",
+                        return_value=torch.device("meta"),
+                    )
+                )
+                modules = magi2_loader.load_magi2_modules(
+                    server_args=server_args,
+                    pipeline=SimpleNamespace(model_path="unused"),
+                    ep_group=None,
+                )
+                for name in self._LOADERS.values():
+                    expected = (
+                        "cpu" if name in offloaded or name == "text_encoder" else "meta"
+                    )
+                    self.assertEqual(
+                        next(modules[name].parameters()).device.type, expected
+                    )
 
     def test_defaults_are_unchanged(self):
         bf16, fp32 = torch.bfloat16, torch.float32

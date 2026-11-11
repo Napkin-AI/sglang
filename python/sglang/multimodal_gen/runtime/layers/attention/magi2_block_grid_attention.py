@@ -14,6 +14,8 @@ from torch.nn.attention.flex_attention import BlockMask, create_mask, flex_atten
 from sglang.multimodal_gen.configs.models.dits.magi2 import Magi2RefinerArchConfig
 
 _TILE = 128
+_NPU_MAX_BLOCKS_PER_BATCH = 16
+_NPU_MAX_PACKED_KV_TOKENS = 131072
 
 # Each distinct sequence length compiles its own graph, hence SEQ_BUCKET.
 _flex_attention = torch.compile(flex_attention, dynamic=False)
@@ -214,6 +216,39 @@ def cached_ffa_ranges(
     return torch.cat(q_ranges), torch.cat(k_ranges)
 
 
+@functools.lru_cache(maxsize=4)
+def _npu_block_batches(*, grid: Magi2BlockGrid) -> tuple:
+    """Pack independent query blocks without a dense mask or persistent KV copies."""
+    q_ranges, k_ranges = cached_ffa_ranges(grid=grid, device=torch.device("cpu"))
+    neighbors = {}
+    for q_range, k_range in zip(q_ranges.tolist(), k_ranges.tolist()):
+        # Global tail interactions are added below; here keep video neighborhoods.
+        if q_range[1] <= grid.num_video_tokens and k_range[1] <= grid.num_video_tokens:
+            neighbors.setdefault(tuple(q_range), []).append(tuple(k_range))
+
+    batches, batch, packed_kv = [], [], 0
+    for (start, stop), ranges in sorted(neighbors.items()):
+        if grid.num_valid_tokens > grid.num_video_tokens:
+            ranges.append((grid.num_video_tokens, grid.num_valid_tokens))
+        kv_tokens = sum(hi - lo for lo, hi in ranges)
+        if batch and (
+            len(batch) >= _NPU_MAX_BLOCKS_PER_BATCH
+            or packed_kv + kv_tokens > _NPU_MAX_PACKED_KV_TOKENS
+        ):
+            batches.append(tuple(batch))
+            batch, packed_kv = [], 0
+        batch.append((start, stop, tuple(ranges)))
+        packed_kv += kv_tokens
+    if batch:
+        batches.append(tuple(batch))
+    if grid.seq_len > grid.num_video_tokens:
+        # Tail and padded queries are dense, but padded keys are never visible.
+        batches.append(
+            ((grid.num_video_tokens, grid.seq_len, ((0, grid.num_valid_tokens),)),)
+        )
+    return tuple(batches)
+
+
 def _tile_coord_bounds(
     *, grid: Magi2BlockGrid, device: torch.device
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -348,7 +383,9 @@ class Magi2BlockGridAttention(nn.Module):
             # Per-tensor: the packed helper asserts q/k/v share a shape, and this is GQA.
             q, k, v = (_usp_input_all_to_all(t[None], head_dim=2)[0] for t in (q, k, v))
 
-        if _HAS_FFA and not self.dense_fallback:
+        if q.device.type == "npu":
+            out = self._attend_npu(q=q, k=k, v=v, grid=grid)
+        elif _HAS_FFA and not self.dense_fallback:
             # FFA takes the packed [S, H, D] layout directly, with no transpose.
             out = self._attend_ffa(q=q, k=k, v=v, grid=grid)
         else:
@@ -361,6 +398,45 @@ class Magi2BlockGridAttention(nn.Module):
 
         if ulysses:
             out = _usp_output_all_to_all(out[None], head_dim=2)[0]
+        return out
+
+    def _attend_npu(
+        self,
+        *,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        grid: Magi2BlockGrid,
+    ) -> torch.Tensor:
+        # Every query in a video block sees the same neighboring blocks and tail.
+        # Gather only these keys, then let native FA handle each packed sequence.
+        # This is intentionally an eager compatibility path, not a sparse kernel.
+        out = torch.empty_like(q)
+        for batch in _npu_block_batches(grid=grid):
+            q_ends, kv_ends, key_parts, value_parts = [], [], [], []
+            q_total, kv_total = 0, 0
+            for start, stop, ranges in batch:
+                q_total += stop - start
+                q_ends.append(q_total)
+                for lo, hi in ranges:
+                    key_parts.append(k[lo:hi])
+                    value_parts.append(v[lo:hi])
+                    kv_total += hi - lo
+                kv_ends.append(kv_total)
+            start, stop = batch[0][0], batch[-1][1]
+            keys = key_parts[0] if len(key_parts) == 1 else torch.cat(key_parts)
+            values = value_parts[0] if len(value_parts) == 1 else torch.cat(value_parts)
+            out[start:stop] = torch.ops.npu.npu_fused_infer_attention_score(
+                q[start:stop].contiguous(),
+                keys.contiguous(),
+                values.contiguous(),
+                num_heads=q.shape[1],
+                num_key_value_heads=k.shape[1],
+                scale=self.softmax_scale,
+                input_layout="TND",
+                actual_seq_lengths=q_ends,
+                actual_seq_lengths_kv=kv_ends,
+            )[0]
         return out
 
     def _attend_ffa(

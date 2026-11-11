@@ -20,6 +20,9 @@ ROUTE_NORM_EPS = 1e-12
 # than this takes an illegal memory access. Experts run in head chunks that fit.
 MAX_KERNEL_EXPERTS = 1023
 
+# Bound the top-k-expanded activations while the next offloaded layer prefetches.
+_NPU_EXPERT_TOKEN_CHUNK = 4096
+
 
 class Magi2MultiHeadRouter(nn.Module):
     """``gate`` is ``[num_heads * num_experts, head_dim]``; returned ids are flattened global ids."""
@@ -90,7 +93,7 @@ class Magi2MultiHeadRouter(nn.Module):
 
 
 class Magi2MultiHeadExperts(nn.Module):
-    """Weight layout follows sglang's grouped-expert convention, gate half first, so ``fused_experts`` runs unmodified."""
+    """Grouped experts with interleaved gate/up rows and rank-local expert IDs."""
 
     def __init__(
         self,
@@ -133,6 +136,9 @@ class Magi2MultiHeadExperts(nn.Module):
         w2: torch.Tensor,
         num_experts: int,
     ) -> torch.Tensor:
+        if tokens.device.type == "npu":
+            return self._run_heads_npu(tokens, topk_ids, topk_weights, w13, w2)
+
         from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
         from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
             fused_experts,
@@ -171,6 +177,80 @@ class Magi2MultiHeadExperts(nn.Module):
             runner_config,
             fuse_swiglu_interleaved=True,
         ).type_as(tokens)
+
+    def _run_heads_npu(
+        self,
+        tokens: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        w13: torch.Tensor,
+        w2: torch.Tensor,
+    ) -> torch.Tensor:
+        # Match the CUDA expert path's bf16 GEMMs. Transposed weight views are
+        # supported by GMM; do not repack/cache offloaded expert parameters.
+        w13 = w13.bfloat16().transpose(1, 2)
+        w2 = w2.bfloat16().transpose(1, 2)
+        output = torch.empty_like(tokens)
+        for start in range(0, tokens.shape[0], _NPU_EXPERT_TOKEN_CHUNK):
+            stop = min(start + _NPU_EXPERT_TOKEN_CHUNK, tokens.shape[0])
+            output[start:stop] = self._run_heads_npu_chunk(
+                tokens[start:stop],
+                topk_ids[start:stop],
+                topk_weights[start:stop],
+                w13,
+                w2,
+            )
+        return output
+
+    def _run_heads_npu_chunk(
+        self,
+        tokens: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        w13: torch.Tensor,
+        w2: torch.Tensor,
+    ) -> torch.Tensor:
+        from sglang.multimodal_gen.runtime.models.dits.magi2_common import (
+            swiglu7_interleaved,
+        )
+
+        expanded, row_map, groups, _ = torch.ops.npu.npu_moe_init_routing_v2(
+            tokens.bfloat16().contiguous(),
+            topk_ids.to(torch.int32).contiguous(),
+            expert_num=w13.shape[0],
+            active_num=topk_ids.numel(),
+            active_expert_range=[0, w13.shape[0]],
+            expert_tokens_num_type=0,
+            expert_tokens_num_flag=True,
+            drop_pad_mode=0,
+            row_idx_type=0,
+            quant_mode=-1,
+        )
+        gate_up = torch.ops.npu.npu_grouped_matmul(
+            x=[expanded],
+            weight=[w13],
+            group_list=groups,
+            split_item=2,
+            group_type=0,
+            group_list_type=0,
+        )[0]
+        activated = swiglu7_interleaved(gate_up)
+        del gate_up, expanded
+        down = torch.ops.npu.npu_grouped_matmul(
+            x=[activated],
+            weight=[w2],
+            group_list=groups,
+            split_item=2,
+            group_type=0,
+            group_list_type=0,
+        )[0]
+        # row_idx_type=0 maps each original token/top-k slot to its sorted row.
+        restored = down.index_select(0, row_map.long()).view(
+            tokens.shape[0], topk_ids.shape[1], tokens.shape[1]
+        )
+        return (
+            (restored.float() * topk_weights.float()[..., None]).sum(1).to(tokens.dtype)
+        )
 
     # Opaque to dynamo: autotuning these GEMMs asks more shared memory than sm90
     # has, so a compiled region containing them fails to build.

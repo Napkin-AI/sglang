@@ -9,6 +9,9 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ulysses_parallel_rank,
     get_ulysses_parallel_world_size,
 )
+from sglang.multimodal_gen.runtime.layers.attention.backends.ascend_fa import (
+    fused_infer_attention_varlen,
+)
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionRequirements,
 )
@@ -20,7 +23,7 @@ from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 
 class Magi2SinkAttention(nn.Module):
-    """``USPAttention``'s varlen paths cannot pass sink logits, so this drives ``FlashAttentionImpl`` directly."""
+    """Packed sink attention with Ulysses head sharding on CUDA and Ascend."""
 
     def __init__(
         self,
@@ -53,7 +56,7 @@ class Magi2SinkAttention(nn.Module):
             return None
         if self.sinks.shape[0] != 1:
             raise ValueError(
-                "FlashAttention takes one sink logit per head, so "
+                "MAGI-2 attention supports one sink logit per head, so "
                 f"sink_token_num must be 1; got {self.sinks.shape[0]}"
             )
         # The checkpoint stores [sink_token_num, num_heads]; the kernel wants flat.
@@ -98,6 +101,42 @@ class Magi2SinkAttention(nn.Module):
             window_size=self.window_size,
         )
 
+    def _forward_npu(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        cu_seqlens: torch.Tensor,
+    ) -> torch.Tensor:
+        # The preview uses full attention. Do not silently drop a window if a
+        # future configuration adds one: the packed Ascend helper is unmasked.
+        if self.window_size != (-1, -1):
+            raise NotImplementedError(
+                "MAGI-2 Ascend sink attention currently supports only full "
+                "attention (window_size=(-1, -1))"
+            )
+        sinks = self._local_sinks()
+        result = fused_infer_attention_varlen(
+            q,
+            k,
+            v,
+            cu_seqlens,
+            cu_seqlens,
+            softmax_scale=self.softmax_scale,
+            return_softmax_lse=sinks is not None,
+        )
+        if sinks is None:
+            return result
+
+        out, lse = result  # LSE is [local_heads, packed_tokens], in fp32.
+        # The sink has a logit but no value: multiply ordinary attention by
+        # Z / (Z + exp(sink)) = sigmoid(log(Z) - sink). This avoids an S x S
+        # allocation and does not require a native learnable-sink operator.
+        # Read the live parameter each time; layerwise offload rebinds storage.
+        factor = torch.sigmoid(lse - sinks.float()[:, None]).transpose(0, 1)
+        return (out.float() * factor[..., None]).to(out.dtype)
+
     def forward(
         self,
         q: torch.Tensor,
@@ -116,14 +155,17 @@ class Magi2SinkAttention(nn.Module):
         if ulysses:
             q, k, v = _usp_input_all_to_all_packed_qkv(q, k, v)
 
-        self._ensure_impl(q.dtype)
-        out = self._impl.forward_varlen(
-            q,
-            k,
-            v,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
-        )
+        if q.device.type == "npu":
+            out = self._forward_npu(q, k, v, cu_seqlens=cu_seqlens)
+        else:
+            self._ensure_impl(q.dtype)
+            out = self._impl.forward_varlen(
+                q,
+                k,
+                v,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+            )
 
         if ulysses:
             out = _usp_output_all_to_all(out[None], head_dim=2)[0]
