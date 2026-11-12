@@ -113,6 +113,13 @@ class Magi2PipelineConfig(PipelineConfig):
         super().validate_server_args(server_args)
         self._warn_about_allocator()
 
+        if server_args.quantization or server_args.component_quantizations:
+            raise ValueError(
+                "MAGI-2's native loader does not implement quantization; "
+                "quantization flags would leave its weights unquantized. "
+                "Use checkpoint precision with offload and expert parallelism."
+            )
+
         if server_args.enable_cfg_parallel:
             raise ValueError(
                 "MAGI-2's denoise loop runs both CFG branches itself; "
@@ -169,8 +176,12 @@ class Magi2PipelineConfig(PipelineConfig):
         axes = {"preview attention heads": preview.num_attention_heads}
         if self.enable_refiner:
             refiner = self.refiner_dit_config.arch_config
-            axes["refiner attention heads"] = refiner.num_attention_heads
-            axes["refiner KV heads"] = refiner.num_query_groups
+            if refiner.num_attention_heads % refiner.num_query_groups:
+                raise ValueError(
+                    "MAGI-2 refiner attention heads must be divisible by KV heads"
+                )
+            # Refiner attention pads whole GQA groups before Ulysses exchange,
+            # allowing EP6/12 without changing the checkpoint's 32 Q / 8 KV.
 
         for name, count in sorted(axes.items(), key=lambda item: item[1]):
             if count % num_gpus:

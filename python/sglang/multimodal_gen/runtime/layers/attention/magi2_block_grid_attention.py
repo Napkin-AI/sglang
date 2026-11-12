@@ -86,7 +86,7 @@ class Magi2BlockGrid(msgspec.Struct, frozen=True):
         return math.ceil(self.seq_len / _TILE)
 
 
-# Divides every supported sp degree, so the shard adds no padding of its own.
+# Power-of-two SP degrees need no extra padding; other degrees add masked rows.
 SEQ_BUCKET = 8 * _TILE
 
 
@@ -378,8 +378,19 @@ class Magi2BlockGridAttention(nn.Module):
             _usp_output_all_to_all,
         )
 
-        ulysses = get_ulysses_parallel_world_size() > 1
+        ulysses_size = get_ulysses_parallel_world_size()
+        ulysses = ulysses_size > 1
+        num_heads = q.shape[1]
         if ulysses:
+            # Pad whole GQA groups so each rank retains the original query/KV
+            # mapping. For EP6/12, 32 Q / 8 KV becomes 48 Q / 12 KV; rounding
+            # the Q and KV counts independently would change that mapping.
+            kv_padding = -k.shape[1] % ulysses_size
+            if kv_padding:
+                queries_per_kv = num_heads // k.shape[1]
+                q = F.pad(q, (0, 0, 0, kv_padding * queries_per_kv))
+                k = F.pad(k, (0, 0, 0, kv_padding))
+                v = F.pad(v, (0, 0, 0, kv_padding))
             # Per-tensor: the packed helper asserts q/k/v share a shape, and this is GQA.
             q, k, v = (_usp_input_all_to_all(t[None], head_dim=2)[0] for t in (q, k, v))
 
@@ -398,6 +409,9 @@ class Magi2BlockGridAttention(nn.Module):
 
         if ulysses:
             out = _usp_output_all_to_all(out[None], head_dim=2)[0]
+            # Only the inverse exchange restores global head order: removing
+            # padding before it would give ranks unequal collective shapes.
+            out = out[:, :num_heads]
         return out
 
     def _attend_npu(

@@ -1,0 +1,6 @@
+Check
+Reduce GPU Memory Usage.html
+Reduce GPU Memory Usage_files/
+The problem: A2/A3 Magi-2-preview is supported on the branch workspace/huawei/sglang only with offloading transformer/transformet_2 and other checkpoints; A2/A3 has 64 gb vram and only 55-60 per device for moe; ep 4 is not good here or quantization is needed;
+I guess quantization w8a8_int8 is a good idea for a2/a3 here; check pull requests to sglang sgl-project/sglang/pull/44738
+Make a plan and a patch with quantization or support ep 6/12 or smthg

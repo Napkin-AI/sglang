@@ -145,9 +145,10 @@ parallelism shares those same ranks to split the preview MoE by head. Expert
 parallelism defaults to the world size, but can be sized below it — which is what
 makes 8 ranks work, since 8 does not divide the 12 MoE heads.
 
-`--num-gpus` must divide every Ulysses head axis, because a rank owns whole heads
-on all of them. The MoE heads are sharded by `ep_size` instead, so they are checked
-against that. All four are checked at launch rather than deep inside a collective:
+`--num-gpus` must divide the preview attention head count. The MoE heads are
+sharded by `ep_size`, which must divide both the world size and 12. Refiner
+attention pads complete GQA groups when its KV head count does not divide the
+Ulysses degree, then removes dummy query heads after the inverse exchange:
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
@@ -170,12 +171,12 @@ against that. All four are checked at launch rather than deep inside a collectiv
     </tr>
     <tr style={{borderBottom: "1px solid rgba(255,255,255,0.08)"}}>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Refiner attention heads</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>32</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>32 (padded to 48 at 6/12 ranks)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`--num-gpus`</td>
     </tr>
     <tr style={{borderBottom: "1px solid rgba(255,255,255,0.08)"}}>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Refiner key/value heads (GQA)</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>8 (padded to 12 at 6/12 ranks)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`--num-gpus`</td>
     </tr>
     <tr style={{borderBottom: "1px solid rgba(255,255,255,0.08)"}}>
@@ -229,14 +230,17 @@ preview plus 5 refiner steps, steady-state clip:
   </tbody>
 </table>
 
-**Use 4 GPUs unless you have a reason not to.** 8 is 1.37x faster per clip but
+**For the measured H200 configurations below**, 8 is 1.37x faster per clip but
 spends 46% more GPU-time to get there, so it buys latency rather than throughput;
 2 and 4 cost the same GPU-seconds per clip. Two concurrent 4-GPU deployments beat
 one 8-GPU deployment on total output.
 
 <Warning>
-6 and 12 GPUs satisfy the preview head axes but fail the refiner's 8 key/value
-heads, so they are preview-only counts.
+6 and 12 devices can run both stages with EP equal to the device count. The
+refiner exchanges 48 query heads and 12 KV heads, preserving its four queries
+per KV head. This adds 50% to the refiner's attention head workload and head
+exchange payload; it does not enlarge refiner weights. End-to-end latency and
+peak memory for these configurations have not been measured.
 
 8 GPUs divides every Ulysses axis but not the preview's 12 MoE heads, so it needs
 an explicit `ep_size` of 4 — two expert-parallel groups of 4 ranks, each holding
@@ -409,6 +413,59 @@ alone.
 To skip loading the refiner weights altogether rather than skipping the pass,
 turn the refiner off in the pipeline configuration. There is no CLI flag for it;
 see the configuration notes below.
+
+### Ascend A2/A3 with EP6 or EP12
+
+Use the existing Ascend environment for this branch, with compatible CANN and
+`torch_npu`. The numbers below are calculated **routed expert weights only**,
+not measured device peaks; dense layers, VAEs, the refiner, activations, and
+communication buffers require additional memory.
+
+| Expert parallel size | BF16 routed weights per device |
+| --- | --- |
+| 4 | 50.625 GiB |
+| 6 | 33.750 GiB |
+| 12 | 16.875 GiB |
+
+For six visible NPUs on one host, first run two preview steps plus the default
+five refiner steps. Whole-component offload loads each DiT for its stage and
+releases it afterward, avoiding per-layer transfers on every denoising step.
+Each active DiT must still fit in device memory. The loader already starts
+these offloaded components on CPU.
+
+```bash
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+unset SGLANG_CACHE_DIT_ENABLED
+
+sglang generate \
+  --model-path /path/to/MAGI-2-preview \
+  --num-gpus 6 \
+  --ulysses-degree 6 \
+  --component-residency transformer=component-offload transformer_2=component-offload \
+  --num-inference-steps 2 \
+  --prompt "A fox running through a snowy forest" \
+  --save-output
+```
+
+EP defaults to the world size; no pipeline JSON is needed. For twelve visible
+NPUs on one host, select those devices and change both degree flags to `12`.
+For a preview-only diagnostic, pass a pipeline JSON containing
+`{"enable_refiner": false}` through `--pipeline-config-path` and add
+`--width 896 --height 512`. Remove `--num-inference-steps 2` for normal quality
+after validating loading, both denoising stages, and decoding. A short step
+count does not reduce the per-step memory requirement.
+
+If the active preview still exceeds the available device memory, use
+`transformer=layerwise-offload` with `--dit-offload-prefetch-size 1`. EP12 gives
+more weight headroom than EP6. Neither topology guarantees a 55–60 GiB peak.
+
+The generic diffusion `w8a8_int` linear integration in
+[PR #44738](https://github.com/sgl-project/sglang/pull/44738) does not quantize
+MAGI's raw MoE expert tensors through its custom loader. INT8 expert support
+requires separate loader and grouped-matmul integration; this EP patch keeps
+BF16 weights. MAGI-2 rejects quantization flags until that integration exists,
+so an INT8 request cannot silently load unquantized weights.
 
 ## 6. Offload
 

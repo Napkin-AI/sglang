@@ -21,7 +21,7 @@ from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     VideoGenerationsRequest,
 )
-from sglang.multimodal_gen.runtime.layers import moe_multihead
+from sglang.multimodal_gen.runtime.layers import moe_multihead, usp
 from sglang.multimodal_gen.runtime.layers.attention import (
     magi2_block_grid_attention,
     magi2_sink_attention,
@@ -1019,6 +1019,109 @@ class TestMagi2NpuExperts(CustomTestCase):
 
 class TestMagi2NpuBlockGrid(CustomTestCase):
     @staticmethod
+    def _exchange_rank_tensors(tensors, exchange):
+        """Replay an equal-split all-to-all using the production layout helpers."""
+        sends = []
+
+        def capture(x, role):
+            sends.append(x.clone())
+            return x
+
+        with mock.patch.object(usp, "_usp_all_to_all_single", side_effect=capture):
+            for tensor in tensors:
+                exchange(tensor, head_dim=2)
+        degree = len(tensors)
+        received = [
+            torch.cat([send.chunk(degree, dim=0)[rank] for send in sends], dim=0)
+            for rank in range(degree)
+        ]
+        with mock.patch.object(usp, "_usp_all_to_all_single", side_effect=received):
+            return [exchange(tensor, head_dim=2) for tensor in tensors]
+
+    def test_ulysses_padding_with_sequence_shards_and_inverse_exchange(self):
+        """Head padding must also preserve sequence order and exclude SP pad keys."""
+        generator = torch.Generator().manual_seed(71)
+        full = [torch.randn(9, heads, 16, generator=generator) for heads in (32, 8, 8)]
+        input_exchange = usp._usp_input_all_to_all
+        output_exchange = usp._usp_output_all_to_all
+        attention = Magi2BlockGridAttention(
+            num_heads=32, num_kv_heads=8, head_dim=16, dense_fallback=True
+        )
+        for degree in (2, 4, 6, 12):
+            pad = -9 % degree
+            grid = Magi2BlockGrid(
+                latent_thw=(1, 2, 3),
+                block_thw=(1, 1, 1),
+                radius_thw=(0, 1, 0),
+                num_tail_tokens=3,
+                num_pad_tokens=pad,
+            )
+            padded = [torch.cat((t, t[-1:].expand(pad, -1, -1))) for t in full]
+            expected = self._reference(grid, *padded)
+            sequence_shards = [list(t.chunk(degree, dim=0)) for t in padded]
+            kv_pad = -8 % degree
+            head_shards = [
+                [
+                    F.pad(t[None], (0, 0, 0, kv_pad * (4 if i == 0 else 1)))
+                    for t in shards
+                ]
+                for i, shards in enumerate(sequence_shards)
+            ]
+            with (
+                mock.patch.object(
+                    usp, "get_ulysses_parallel_world_size", return_value=degree
+                ),
+                mock.patch.object(usp, "_ipc_varlen_fast", return_value=None),
+                mock.patch(
+                    "sglang.multimodal_gen.runtime.distributed.parallel_state.get_ulysses_parallel_world_size",
+                    return_value=degree,
+                ),
+            ):
+                exchanged = [
+                    self._exchange_rank_tensors(ts, input_exchange)
+                    for ts in head_shards
+                ]
+                pre_inverse = []
+
+                def capture_output(t, head_dim):
+                    pre_inverse.append(t)
+                    return torch.zeros_like(head_shards[0][0])
+
+                for rank in range(degree):
+                    with (
+                        mock.patch.object(
+                            usp,
+                            "_usp_input_all_to_all",
+                            side_effect=[ts[rank] for ts in exchanged],
+                        ),
+                        mock.patch.object(
+                            usp, "_usp_output_all_to_all", side_effect=capture_output
+                        ),
+                    ):
+                        attention(*(ts[rank] for ts in sequence_shards), grid=grid)
+                restored = self._exchange_rank_tensors(pre_inverse, output_exchange)
+                for rank in range(degree):
+                    with (
+                        mock.patch.object(
+                            usp,
+                            "_usp_input_all_to_all",
+                            side_effect=[ts[rank] for ts in exchanged],
+                        ),
+                        mock.patch.object(
+                            usp, "_usp_output_all_to_all", return_value=restored[rank]
+                        ),
+                    ):
+                        actual = attention(
+                            *(ts[rank] for ts in sequence_shards), grid=grid
+                        )
+                    torch.testing.assert_close(
+                        actual,
+                        expected.chunk(degree, dim=0)[rank],
+                        rtol=1e-5,
+                        atol=1e-6,
+                    )
+
+    @staticmethod
     def _packed_attention(q, k, v, **kwargs):
         assert kwargs["input_layout"] == "TND"
         assert kwargs["num_heads"] == q.shape[1]
@@ -1097,6 +1200,99 @@ class TestMagi2NpuBlockGrid(CustomTestCase):
             torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
         magi2_block_grid_attention._npu_block_batches.cache_clear()
 
+    def test_ulysses_padding_preserves_gqa_on_every_head_rank(self):
+        """Head-only collective simulation checks padded and existing degrees."""
+        grid = Magi2BlockGrid(
+            latent_thw=(1, 2, 2),
+            block_thw=(1, 1, 1),
+            radius_thw=(0, 1, 0),
+            num_tail_tokens=2,
+        )
+        generator = torch.Generator().manual_seed(38)
+        q = torch.randn(grid.seq_len, 32, 16, generator=generator)
+        k, v = [torch.randn(grid.seq_len, 8, 16, generator=generator) for _ in range(2)]
+        expected = self._reference(grid, q, k, v)
+        attention = Magi2BlockGridAttention(
+            num_heads=32, num_kv_heads=8, head_dim=16, dense_fallback=True
+        )
+
+        def npu_backend(*, q, k, v, grid):
+            return attention._attend_npu(
+                q=q[0].transpose(0, 1),
+                k=k[0].transpose(0, 1),
+                v=v[0].transpose(0, 1),
+                grid=grid,
+            ).transpose(0, 1)[None]
+
+        for backend in ("sdpa", "npu_mock"):
+            for degree in (1, 2, 4, 6, 8, 12):
+                with self.subTest(backend=backend, degree=degree):
+                    padded_kv = -(-8 // degree) * degree
+                    restored = []
+                    for rank in range(degree):
+
+                        def input_exchange(t, head_dim, *, degree=degree, rank=rank):
+                            self.assertEqual(head_dim, 2)
+                            self.assertEqual(t.shape[2] % degree, 0)
+                            return t.chunk(degree, dim=2)[rank].contiguous()
+
+                        def output_exchange(
+                            t,
+                            head_dim,
+                            *,
+                            degree=degree,
+                            rank=rank,
+                            padded_kv=padded_kv,
+                        ):
+                            self.assertEqual(head_dim, 2)
+                            local_heads = padded_kv * 4 // degree
+                            self.assertEqual(t.shape[2], local_heads)
+                            # Put this rank's heads back in global order; sum
+                            # all ranks below to emulate the inverse exchange.
+                            return F.pad(
+                                t,
+                                (
+                                    0,
+                                    0,
+                                    rank * local_heads,
+                                    (degree - rank - 1) * local_heads,
+                                ),
+                            )
+
+                        with (
+                            mock.patch(
+                                "sglang.multimodal_gen.runtime.distributed.parallel_state.get_ulysses_parallel_world_size",
+                                return_value=degree,
+                            ),
+                            mock.patch(
+                                "sglang.multimodal_gen.runtime.layers.usp._usp_input_all_to_all",
+                                side_effect=input_exchange,
+                            ),
+                            mock.patch(
+                                "sglang.multimodal_gen.runtime.layers.usp._usp_output_all_to_all",
+                                side_effect=output_exchange,
+                            ),
+                            mock.patch.object(
+                                torch.ops.npu,
+                                "npu_fused_infer_attention_score",
+                                self._packed_attention,
+                                create=True,
+                            ),
+                            (
+                                mock.patch.object(
+                                    attention, "_attend", side_effect=npu_backend
+                                )
+                                if backend == "npu_mock"
+                                else contextlib.nullcontext()
+                            ),
+                        ):
+                            out = attention(q, k, v, grid=grid)
+                        self.assertEqual(out.shape, q.shape)
+                        restored.append(out)
+                    torch.testing.assert_close(
+                        torch.stack(restored).sum(0), expected, rtol=1e-5, atol=1e-6
+                    )
+
     @unittest.skipUnless(current_platform.is_npu(), "requires Ascend NPU")
     def test_npu_block_grid_matches_reference(self):
         grid = Magi2BlockGrid(
@@ -1172,6 +1368,8 @@ class _AudioVae(_M):
 
 def _validate_args(**overrides):
     args = dict(
+        quantization=None,
+        component_quantizations={},
         enable_cfg_parallel=False,
         attention_backend=None,
         dp_size=1,
@@ -1306,7 +1504,46 @@ class TestDenoisingStageContract(_StageArgsTestCase):
                     stage.forward(Req(sampling_params=params), self.server_args)
 
 
-class TestServerArgsValidation(unittest.TestCase):
+class TestServerArgsValidation(CustomTestCase):
+    def test_quantization_flags_cannot_silently_leave_magi2_unquantized(self):
+        """The native loader bypasses quantized LinearBase creation and loading."""
+        for overrides in (
+            {"quantization": "w8a8_int"},
+            {"component_quantizations": {"transformer": "w8a8_int"}},
+            {"component_quantizations": {"transformer_2": "w8a8_int"}},
+        ):
+            with self.subTest(overrides=overrides):
+                with self.assertRaisesRegex(
+                    ValueError, "does not implement quantization"
+                ):
+                    Magi2PipelineConfig().validate_server_args(
+                        _validate_args(**overrides)
+                    )
+
+    def test_preview_and_refiner_accept_ep6_and_ep12(self):
+        for enable_refiner in (False, True):
+            for degree in (1, 2, 4, 6, 12):
+                with self.subTest(enable_refiner=enable_refiner, degree=degree):
+                    config = Magi2PipelineConfig(
+                        enable_refiner=enable_refiner, ep_size=degree
+                    )
+                    config.validate_server_args(_validate_args(num_gpus=degree))
+
+    def test_eight_devices_still_require_explicit_ep4(self):
+        Magi2PipelineConfig(ep_size=4).validate_server_args(_validate_args(num_gpus=8))
+        with self.assertRaisesRegex(ValueError, "MoE heads"):
+            Magi2PipelineConfig().validate_server_args(_validate_args(num_gpus=8))
+
+    def test_head_padding_does_not_relax_moe_and_preview_constraints(self):
+        with self.assertRaisesRegex(ValueError, "MoE heads"):
+            Magi2PipelineConfig(ep_size=5).validate_server_args(
+                _validate_args(num_gpus=5)
+            )
+        with self.assertRaisesRegex(ValueError, "preview attention heads"):
+            Magi2PipelineConfig(ep_size=4).validate_server_args(
+                _validate_args(num_gpus=16)
+            )
+
     def test_only_flash_attention_is_accepted(self):
         """Other backends drop the preview DiT's sink logits without an error."""
         config = Magi2PipelineConfig()
