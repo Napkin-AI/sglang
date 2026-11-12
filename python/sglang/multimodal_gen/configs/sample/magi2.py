@@ -2,10 +2,7 @@
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
-from sglang.multimodal_gen.configs.sample.sampling_params import (
-    SamplingParams,
-    align_num_frames_for_num_gpus,
-)
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 
 # 1088 rather than 1080: the VAE stride forces multiples of 16.
 MAGI2_RESOLUTIONS = [(1920, 1088), (896, 512)]
@@ -68,6 +65,7 @@ class Magi2SamplingParams(SamplingParams):
 
     num_frames: int = MAGI2_NUM_FRAMES
     fps: int = MAGI2_REFINER_FPS
+    adjust_frames: bool = False
 
     guidance_scale: float = 5.0
     audio_guidance_scale: float = 7.0
@@ -84,6 +82,12 @@ class Magi2SamplingParams(SamplingParams):
             self.supported_resolutions = list(MAGI2_RESOLUTIONS)
         super().__post_init__()
 
+    def _adjust_visual_fields(self, server_args, pipeline_config):
+        # MAGI-2 pads packed tokens for sequence parallelism. Aligning latent
+        # frames to the device count instead changes its fixed clip duration.
+        self.adjust_frames = False
+        super()._adjust_visual_fields(server_args, pipeline_config)
+
     def _validate(self) -> None:
         super()._validate()
 
@@ -92,8 +96,8 @@ class Magi2SamplingParams(SamplingParams):
                 f"MAGI-2 supports {MAGI2_RESOLUTIONS}, got {self.width}x{self.height}"
             )
 
-        # Tolerance: causal decode yields 4k+1 frames, and num_frames is rounded up
-        # so the latent count divides the sequence-parallel degree.
+        # Tolerance accounts for causal decode yielding 4k+1 frames rather than
+        # exactly fps * duration. Sequence parallelism must not extend the clip.
         nominal_frames = MAGI2_CLIP_SECONDS * self.fps
         if abs(self.num_frames - nominal_frames) > 0.05 * nominal_frames:
             raise ValueError(
@@ -117,17 +121,8 @@ class Magi2SamplingParams(SamplingParams):
         req.width, req.height = self._default_width, self._default_height
         if server_args.warmup_num_frames is not None:
             return
-        # Warmup skips _adjust, so apply the same per-GPU rounding real requests get.
-        req.num_frames = (
-            align_num_frames_for_num_gpus(
-                MAGI2_NUM_FRAMES,
-                num_gpus=server_args.num_gpus,
-                vae_config=server_args.pipeline_config.vae_config,
-                round_down=self.num_frames_round_down,
-            )
-            if self.adjust_frames
-            else MAGI2_NUM_FRAMES
-        )
+        # Warmup skips _adjust; keep the same fixed length as real requests.
+        req.num_frames = MAGI2_NUM_FRAMES
 
     @classmethod
     def lower_video_request_kwargs(

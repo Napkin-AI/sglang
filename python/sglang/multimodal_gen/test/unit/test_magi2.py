@@ -1837,7 +1837,7 @@ class TestLoaderPrecision(CustomTestCase):
                 self.assertEqual(self._loaded_dtypes({component: "fp16"}), want)
 
 
-class TestSyntheticWarmup(unittest.TestCase):
+class TestSyntheticWarmup(CustomTestCase):
     def _warmup_args(self, **overrides):
         args = dict(
             warmup_resolutions=None,
@@ -1849,16 +1849,33 @@ class TestSyntheticWarmup(unittest.TestCase):
         return SimpleNamespace(**args)
 
     def test_default_warmup_runs_the_two_stage_tier_at_full_length(self):
-        """The generic probe picked the preview tier, leaving the refiner cold."""
-        params = Magi2SamplingParams(prompt="x")
-        for num_gpus, frames in ((1, 249), (4, 253), (8, 253)):
+        """Warmup must neither skip the refiner nor extend the fixed clip for SP."""
+        params = Magi2SamplingParams(prompt="x", adjust_frames=True)
+        for num_gpus in (1, 4, 6, 8, 12):
             with self.subTest(num_gpus=num_gpus):
                 req = SimpleNamespace(width=896, height=512, num_frames=17)
                 params.prepare_synthetic_warmup_request_for_queue(
                     req, self._warmup_args(num_gpus=num_gpus)
                 )
                 self.assertEqual((req.width, req.height), (1920, 1088))
-                self.assertEqual(req.num_frames, frames)
+                self.assertEqual(req.num_frames, 249)
+
+    def test_sequence_parallel_request_keeps_fixed_duration(self):
+        """Frame alignment expanded 249 frames to 285 on 12 ranks, failing validation."""
+        for num_gpus in (6, 12):
+            for adjust_frames in (False, True):
+                with self.subTest(num_gpus=num_gpus, adjust_frames=adjust_frames):
+                    params = Magi2SamplingParams(
+                        prompt="x",
+                        width=1920,
+                        height=1088,
+                        num_inference_steps=1,
+                        adjust_frames=adjust_frames,
+                    )
+                    args = self._warmup_args(num_gpus=num_gpus, comfyui_mode=True)
+                    params._adjust_visual_fields(args, args.pipeline_config)
+                    params._validate()
+                    self.assertEqual(params.num_frames, 249)
 
     def test_explicit_warmup_shape_is_kept(self):
         params = Magi2SamplingParams(prompt="x")
