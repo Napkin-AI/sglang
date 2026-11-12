@@ -1370,6 +1370,9 @@ def _validate_args(**overrides):
     args = dict(
         quantization=None,
         component_quantizations={},
+        quantization_ignored_layers=[],
+        component_quantization_ignored_layers={},
+        use_fsdp_inference=False,
         enable_cfg_parallel=False,
         attention_backend=None,
         dp_size=1,
@@ -1505,17 +1508,44 @@ class TestDenoisingStageContract(_StageArgsTestCase):
 
 
 class TestServerArgsValidation(CustomTestCase):
-    def test_quantization_flags_cannot_silently_leave_magi2_unquantized(self):
-        """The native loader bypasses quantized LinearBase creation and loading."""
+    def test_quantization_requires_native_w8a8_on_npu(self):
+        """Unsupported flags must not silently leave native-loaded weights in BF16."""
+        with mock.patch(
+            "sglang.multimodal_gen.configs.pipeline_configs.magi2.current_platform.is_npu",
+            return_value=True,
+        ):
+            for overrides in (
+                {"quantization": "w8a8"},
+                {"component_quantizations": {"transformer": "w8a8_int"}},
+                {"component_quantizations": {"transformer_2": "w8a8"}},
+            ):
+                Magi2PipelineConfig().validate_server_args(_validate_args(**overrides))
+            for overrides in (
+                {"quantization": "fp8"},
+                {"component_quantizations": {"vae": "w8a8"}},
+                {"quantization": "w8a8", "use_fsdp_inference": True},
+            ):
+                with self.assertRaises(ValueError):
+                    Magi2PipelineConfig().validate_server_args(
+                        _validate_args(**overrides)
+                    )
+        with mock.patch(
+            "sglang.multimodal_gen.configs.pipeline_configs.magi2.current_platform.is_npu",
+            return_value=False,
+        ):
+            with self.assertRaisesRegex(ValueError, "requires Ascend NPU"):
+                Magi2PipelineConfig().validate_server_args(
+                    _validate_args(quantization="w8a8")
+                )
+
+    def test_unknown_quantization_is_rejected(self):
         for overrides in (
-            {"quantization": "w8a8_int"},
-            {"component_quantizations": {"transformer": "w8a8_int"}},
-            {"component_quantizations": {"transformer_2": "w8a8_int"}},
+            {"quantization": "unsupported"},
+            {"component_quantizations": {"transformer": "unsupported"}},
+            {"component_quantizations": {"transformer_2": "unsupported"}},
         ):
             with self.subTest(overrides=overrides):
-                with self.assertRaisesRegex(
-                    ValueError, "does not implement quantization"
-                ):
+                with self.assertRaisesRegex(ValueError, "supports only NPU w8a8"):
                     Magi2PipelineConfig().validate_server_args(
                         _validate_args(**overrides)
                     )
@@ -1705,6 +1735,8 @@ class TestLoaderPrecision(CustomTestCase):
     def _loaded_dtypes(self, component_precisions):
         server_args = SimpleNamespace(
             pipeline_config=Magi2PipelineConfig(),
+            quantization=None,
+            component_quantizations={},
             component_precisions=component_precisions,
             should_start_component_on_cpu=lambda name: False,
         )
@@ -1742,6 +1774,8 @@ class TestLoaderPrecision(CustomTestCase):
             with self.subTest(offloaded=offloaded), contextlib.ExitStack() as stack:
                 server_args = SimpleNamespace(
                     pipeline_config=Magi2PipelineConfig(),
+                    quantization=None,
+                    component_quantizations={},
                     component_precisions={},
                     should_start_component_on_cpu=lambda name: name in offloaded,
                 )

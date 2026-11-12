@@ -111,7 +111,7 @@ class Magi2PreviewDiT(CachableDiT, LayerwiseOffloadableModuleMixin):
         )
 
         streams = rows.view(-1, self.num_stream, self.hidden_size)
-        streams = streams.to(self.blocks[0].attention.linear_qkv.weight.dtype)
+        streams = streams.to(self.blocks[0].attention.linear_qkv.compute_dtype)
 
         (streams, rope, modality_ids), plan = shard_packed_rows(
             streams, rope, layout.modality_ids

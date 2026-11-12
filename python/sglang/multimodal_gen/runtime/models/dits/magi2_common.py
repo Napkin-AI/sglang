@@ -221,12 +221,20 @@ class Magi2ModalityLinear(nn.Module):
         self.weight = nn.Parameter(
             torch.empty(num_modality * out_features, in_features)
         )
+        self.register_parameter("weight_scale", None)
+        self._compute_dtype: torch.dtype | None = None
+
+    @property
+    def compute_dtype(self) -> torch.dtype:
+        return self._compute_dtype or self.weight.dtype
 
     def forward(
         self, x: torch.Tensor, modality_ids: torch.Tensor | None = None
     ) -> torch.Tensor:
         # Precision boundary: callers pass fp32, cross-dtype matmul raises.
-        x = x.to(self.weight.dtype)
+        x = x.to(self.compute_dtype)
+        if self.weight_scale is not None:
+            return self._forward_w8a8(x, modality_ids)
 
         if self.num_modality == 1:
             return torch.nn.functional.linear(x, self.weight)
@@ -242,6 +250,36 @@ class Magi2ModalityLinear(nn.Module):
             # Slice assignment, not linear(out=...), which rejects grad inputs.
             out[start : start + count] = torch.nn.functional.linear(
                 x.narrow(0, start, count), weight[modality]
+            )
+        return out
+
+    def _forward_w8a8(
+        self, x: torch.Tensor, modality_ids: torch.Tensor | None
+    ) -> torch.Tensor:
+        from sglang.multimodal_gen.runtime.layers.quantization.magi2_w8a8 import (
+            magi2_w8a8_linear,
+        )
+
+        if self.num_modality == 1:
+            return magi2_w8a8_linear(
+                x, self.weight, self.weight_scale, output_dtype=self.compute_dtype
+            )
+        weights = self.weight.view(
+            self.num_modality, self.out_features, self.in_features
+        )
+        scales = self.weight_scale.view(self.num_modality, self.out_features)
+        if modality_ids.numel() == 1:
+            index = int(modality_ids[0])
+            return magi2_w8a8_linear(
+                x, weights[index], scales[index], output_dtype=self.compute_dtype
+            )
+        out = x.new_empty(x.shape[:-1] + (self.out_features,))
+        for start, count, modality in modality_runs(modality_ids):
+            out[start : start + count] = magi2_w8a8_linear(
+                x.narrow(0, start, count),
+                weights[modality],
+                scales[modality],
+                output_dtype=self.compute_dtype,
             )
         return out
 

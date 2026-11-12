@@ -126,6 +126,8 @@ class Magi2MultiHeadExperts(nn.Module):
         self.w2 = nn.Parameter(
             torch.empty(self.num_local_experts, head_dim, intermediate_size)
         )
+        self.register_parameter("w13_scale", None)
+        self.register_parameter("w2_scale", None)
 
     def _run_heads(
         self,
@@ -135,9 +137,22 @@ class Magi2MultiHeadExperts(nn.Module):
         w13: torch.Tensor,
         w2: torch.Tensor,
         num_experts: int,
+        *,
+        w13_scale: torch.Tensor | None = None,
+        w2_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if tokens.device.type == "npu":
-            return self._run_heads_npu(tokens, topk_ids, topk_weights, w13, w2)
+            return self._run_heads_npu(
+                tokens,
+                topk_ids,
+                topk_weights,
+                w13,
+                w2,
+                w13_scale=w13_scale,
+                w2_scale=w2_scale,
+            )
+        if w13_scale is not None:
+            raise ValueError("MAGI-2 W8A8 expert execution requires Ascend NPU")
 
         from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
         from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
@@ -185,11 +200,15 @@ class Magi2MultiHeadExperts(nn.Module):
         topk_weights: torch.Tensor,
         w13: torch.Tensor,
         w2: torch.Tensor,
+        *,
+        w13_scale: torch.Tensor | None = None,
+        w2_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Match the CUDA expert path's bf16 GEMMs. Transposed weight views are
         # supported by GMM; do not repack/cache offloaded expert parameters.
-        w13 = w13.bfloat16().transpose(1, 2)
-        w2 = w2.bfloat16().transpose(1, 2)
+        if w13_scale is None:
+            w13, w2 = w13.bfloat16(), w2.bfloat16()
+        w13, w2 = w13.transpose(1, 2), w2.transpose(1, 2)
         output = torch.empty_like(tokens)
         for start in range(0, tokens.shape[0], _NPU_EXPERT_TOKEN_CHUNK):
             stop = min(start + _NPU_EXPERT_TOKEN_CHUNK, tokens.shape[0])
@@ -199,6 +218,8 @@ class Magi2MultiHeadExperts(nn.Module):
                 topk_weights[start:stop],
                 w13,
                 w2,
+                w13_scale=w13_scale,
+                w2_scale=w2_scale,
             )
         return output
 
@@ -209,13 +230,19 @@ class Magi2MultiHeadExperts(nn.Module):
         topk_weights: torch.Tensor,
         w13: torch.Tensor,
         w2: torch.Tensor,
+        *,
+        w13_scale: torch.Tensor | None = None,
+        w2_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        from sglang.multimodal_gen.runtime.layers.quantization.magi2_w8a8 import (
+            magi2_grouped_matmul,
+        )
         from sglang.multimodal_gen.runtime.models.dits.magi2_common import (
             swiglu7_interleaved,
         )
 
         expanded, row_map, groups, _ = torch.ops.npu.npu_moe_init_routing_v2(
-            tokens.bfloat16().contiguous(),
+            (tokens if w13_scale is not None else tokens.bfloat16()).contiguous(),
             topk_ids.to(torch.int32).contiguous(),
             expert_num=w13.shape[0],
             active_num=topk_ids.numel(),
@@ -226,24 +253,14 @@ class Magi2MultiHeadExperts(nn.Module):
             row_idx_type=0,
             quant_mode=-1,
         )
-        gate_up = torch.ops.npu.npu_grouped_matmul(
-            x=[expanded],
-            weight=[w13],
-            group_list=groups,
-            split_item=2,
-            group_type=0,
-            group_list_type=0,
-        )[0]
+        gate_up = magi2_grouped_matmul(
+            expanded, w13, groups, scale=w13_scale, output_dtype=tokens.dtype
+        )
         activated = swiglu7_interleaved(gate_up)
         del gate_up, expanded
-        down = torch.ops.npu.npu_grouped_matmul(
-            x=[activated],
-            weight=[w2],
-            group_list=groups,
-            split_item=2,
-            group_type=0,
-            group_list_type=0,
-        )[0]
+        down = magi2_grouped_matmul(
+            activated, w2, groups, scale=w2_scale, output_dtype=tokens.dtype
+        )
         # row_idx_type=0 maps each original token/top-k slot to its sorted row.
         restored = down.index_select(0, row_map.long()).view(
             tokens.shape[0], topk_ids.shape[1], tokens.shape[1]
@@ -269,6 +286,8 @@ class Magi2MultiHeadExperts(nn.Module):
                 self.w13_weight,
                 self.w2,
                 self.num_local_experts,
+                w13_scale=self.w13_scale,
+                w2_scale=self.w2_scale,
             )
 
         # Rows are token-major, so a head slice is dim 1 of the unflattened view;
@@ -290,6 +309,16 @@ class Magi2MultiHeadExperts(nn.Module):
                 self.w13_weight[start * per_head : stop * per_head],
                 self.w2[start * per_head : stop * per_head],
                 (stop - start) * per_head,
+                w13_scale=(
+                    None
+                    if self.w13_scale is None
+                    else self.w13_scale[start * per_head : stop * per_head]
+                ),
+                w2_scale=(
+                    None
+                    if self.w2_scale is None
+                    else self.w2_scale[start * per_head : stop * per_head]
+                ),
             )
             out[:, start:stop] = chunk.view(num_tokens, stop - start, self.head_dim)
         return out.reshape(-1, self.head_dim)

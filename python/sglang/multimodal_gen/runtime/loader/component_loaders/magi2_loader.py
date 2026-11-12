@@ -26,10 +26,17 @@ from sglang.multimodal_gen.configs.models.vaes.magi2 import (
     Magi2TurboVAEConfig,
     Magi2VideoVAEConfig,
 )
-from sglang.multimodal_gen.configs.pipeline_configs.magi2 import Magi2PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.magi2 import (
+    Magi2PipelineConfig,
+    magi2_w8a8_options,
+)
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.layers.attention.magi2_block_grid_attention import (
     Magi2BlockGridAttention,
+)
+from sglang.multimodal_gen.runtime.layers.quantization.magi2_w8a8 import (
+    prepare_magi2_w8a8,
+    quantize_magi2_weight,
 )
 from sglang.multimodal_gen.runtime.loader.utils import (
     get_param_names_mapping,
@@ -336,9 +343,16 @@ def _cast_state_dict(
     rms_norm_names: set[str],
     param_dtype: torch.dtype,
     device: torch.device,
+    quantized_weights: dict[str, str] | None = None,
 ) -> dict[str, torch.Tensor]:
     out: dict[str, torch.Tensor] = {}
-    for name, tensor in state.items():
+    for name in list(state):
+        tensor = state.pop(name)
+        if quantized_weights is not None and name in quantized_weights:
+            quantized, scale = quantize_magi2_weight(tensor, compute_dtype=param_dtype)
+            out[name] = quantized.to(device=device)
+            out[quantized_weights[name]] = scale.to(device=device)
+            continue
         dtype = torch.float32 if name in fp32_names else param_dtype
         tensor = tensor.to(device=device, dtype=dtype)
         if name in rms_norm_names:
@@ -357,7 +371,11 @@ def _load_dit_from_shards(
     param_dtype: torch.dtype,
     device: torch.device,
     max_workers: int,
+    quantize: bool = False,
+    ignored_layers: tuple[str, ...] = (),
 ) -> nn.Module:
+    if quantize and param_dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError("MAGI-2 W8A8 requires bf16 or fp16 DiT precision")
     mapping_fn: Callable[[str], tuple[str, object, object]] = get_param_names_mapping(
         {**config_mapping, **renames}
     )
@@ -372,12 +390,32 @@ def _load_dit_from_shards(
             raw.update(shard_state)
 
     state = _relayout_experts(raw)
+    del raw
+    _assert_full_coverage(model, set(state))
+    fp32_names = _fp32_param_names(model)
+    quantized_weights = (
+        prepare_magi2_w8a8(
+            model,
+            compute_dtype=param_dtype,
+            fp32_names=fp32_names,
+            ignored_layers=ignored_layers,
+        )
+        if quantize
+        else None
+    )
+    if quantized_weights:
+        logger.info(
+            "[magi2] %s: W8A8 quantizes %d local weights on CPU before device placement",
+            type(model).__name__,
+            len(quantized_weights),
+        )
     state = _cast_state_dict(
         state,
-        fp32_names=_fp32_param_names(model),
+        fp32_names=fp32_names,
         rms_norm_names=_rms_norm_param_names(model),
         param_dtype=param_dtype,
         device=device,
+        quantized_weights=quantized_weights,
     )
 
     _assert_full_coverage(model, set(state))
@@ -398,6 +436,8 @@ def load_magi2_preview_dit(
     device: torch.device,
     param_dtype: torch.dtype,
     max_workers: int = 8,
+    quantize: bool = False,
+    ignored_layers: tuple[str, ...] = (),
 ) -> Magi2PreviewDiT:
     arch: Magi2PreviewArchConfig = config.arch_config
     shard = Magi2ExpertShard.from_group(
@@ -425,6 +465,8 @@ def load_magi2_preview_dit(
         param_dtype=param_dtype,
         device=device,
         max_workers=max_workers,
+        quantize=quantize,
+        ignored_layers=ignored_layers,
     )
 
 
@@ -435,6 +477,8 @@ def load_magi2_refiner_dit(
     device: torch.device,
     param_dtype: torch.dtype,
     max_workers: int = 4,
+    quantize: bool = False,
+    ignored_layers: tuple[str, ...] = (),
 ) -> Magi2RefinerDiT:
     """No experts, so the refiner is replicated on every rank and the shard degenerates to a full read."""
     arch: Magi2RefinerArchConfig = config.arch_config
@@ -457,6 +501,8 @@ def load_magi2_refiner_dit(
         param_dtype=param_dtype,
         device=device,
         max_workers=max_workers,
+        quantize=quantize,
+        ignored_layers=ignored_layers,
     )
 
 
@@ -698,6 +744,10 @@ def load_magi2_modules(
     checkpoint_root = pipeline.model_path
     device = get_local_torch_device()
     dtypes = _resolve_magi2_dtypes(server_args)
+    preview_quantized, preview_ignored = magi2_w8a8_options(server_args, "transformer")
+    refiner_quantized, refiner_ignored = magi2_w8a8_options(
+        server_args, "transformer_2"
+    )
 
     def initial_device(component_name: str) -> torch.device:
         if server_args.should_start_component_on_cpu(component_name):
@@ -715,6 +765,8 @@ def load_magi2_modules(
         ep_group=ep_group,
         device=initial_device("transformer"),
         param_dtype=dtypes["transformer"],
+        quantize=preview_quantized,
+        ignored_layers=preview_ignored,
     )
     transformer_2 = (
         load_magi2_refiner_dit(
@@ -722,6 +774,8 @@ def load_magi2_modules(
             config=config.refiner_dit_config,
             device=initial_device("transformer_2"),
             param_dtype=dtypes["transformer_2"],
+            quantize=refiner_quantized,
+            ignored_layers=refiner_ignored,
         )
         if config.enable_refiner
         else None

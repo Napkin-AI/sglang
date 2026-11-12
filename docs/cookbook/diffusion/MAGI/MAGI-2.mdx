@@ -460,12 +460,60 @@ If the active preview still exceeds the available device memory, use
 `transformer=layerwise-offload` with `--dit-offload-prefetch-size 1`. EP12 gives
 more weight headroom than EP6. Neither topology guarantees a 55–60 GiB peak.
 
-The generic diffusion `w8a8_int` linear integration in
-[PR #44738](https://github.com/sgl-project/sglang/pull/44738) does not quantize
-MAGI's raw MoE expert tensors through its custom loader. INT8 expert support
-requires separate loader and grouped-matmul integration; this EP patch keeps
-BF16 weights. MAGI-2 rejects quantization flags until that integration exists,
-so an INT8 request cannot silently load unquantized weights.
+### Online W8A8 on Ascend
+
+Add `--quantization w8a8` to quantize both DiTs from the original BF16/FP16
+checkpoint. This model uses its native loader and INT8 grouped matmuls for
+the routed experts, rather than relying on the generic diffusion linear
+adapter. No offline calibration or pre-quantized checkpoint is required.
+`w8a8_int` is accepted as an alias for this MAGI-2 path.
+
+The loader quantizes each selected weight on CPU after expert sharding and
+projection assembly, then places INT8 weights and channel scales on the
+requested initial device. Activations are dynamically quantized per token
+before each INT8 matmul. The routed experts and modality projections use
+W8A8; the FP32 router, mHC, norms, sinks, and input/output adapters retain
+their checkpoint precision. The text encoder and VAEs are unchanged.
+
+```bash
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+unset SGLANG_CACHE_DIT_ENABLED
+
+sglang generate \
+  --model-path /path/to/MAGI-2-preview \
+  --num-gpus 4 \
+  --ulysses-degree 4 \
+  --quantization w8a8 \
+  --performance-mode memory \
+  --dit-layerwise-offload \
+  --dit-offload-prefetch-size 1 \
+  --enable-torch-compile false \
+  --width 1920 --height 1088 \
+  --prompt "A fox running through a snowy forest" \
+  --save-output
+```
+
+For just the preview DiT, replace the global flag with
+`--component-quantizations.transformer w8a8`. Use
+`--component-quantizations.transformer_2 w8a8` to select just the refiner.
+`--quantization-ignored-layers blocks.0` keeps that module subtree in floating
+point in each selected DiT; component-specific exclusions use
+`--component-quantization-ignored-layers.transformer blocks.0` together with an
+explicit component quantization flag. Patterns match native module paths and
+their subtrees, including shell-style wildcards (quote wildcards in the shell).
+
+The supported execution target is Ascend A2/A3 with compatible CANN and
+`torch_npu` providing dynamic quantization, quantized linear matmul, and
+quantized grouped matmul. W8A8 supports expert parallelism and component or
+layerwise offload; FSDP is rejected. Use BF16 or FP16 DiT precision. Scale
+parameters travel with their weights during offload. Routed INT8 expert
+weights at EP4 require approximately 25.3125 GiB plus scales, before other
+weights, activations, and runtime buffers.
+
+CPU reference checks cover loading and the Python execution contracts with
+native operators emulated. Target-NPU operator/offload parity, full video and
+audio quality, performance, and a sub-64 GB peak still require validation.
 
 ## 6. Offload
 

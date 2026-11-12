@@ -95,7 +95,7 @@ class Magi2RefinerDiT(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         # KNOWN DEVIATION: the reference keeps this residual fp32 for all 30 layers;
         # bf16 here trades accumulation error for footprint.
-        rows = rows.to(self.blocks[0].attention.linear_qkv.weight.dtype)
+        rows = rows.to(self.blocks[0].attention.linear_qkv.compute_dtype)
 
         num_tail = layout.total_tokens - layout.video_index.numel()
 

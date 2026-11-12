@@ -3026,6 +3026,7 @@ class ServerArgs(DisaggServerArgsMixin):
                 "Quantization method for the transformer. If omitted, the method is "
                 "auto-detected from the checkpoint config or safetensors metadata when "
                 "possible. Use this flag to override auto-detection. "
+                "MAGI-2 on Ascend supports online 'w8a8' INT8 weights and activations. "
                 "Online (post-load) quantization from a BF16/FP16 checkpoint "
                 "is supported for 'fp8', 'mxfp4' and 'convrot_int8' (ConvRot INT8 "
                 "W8A8; runs on SGLang's JIT-compiled fused ops on CC 9.0, 10.0, "
@@ -3044,7 +3045,7 @@ class ServerArgs(DisaggServerArgsMixin):
             default=ServerArgs.quantization_ignored_layers,
             help=(
                 "Layer name patterns to keep unquantized during online quantization "
-                "(fp8/mxfp4/convrot_int8). Each pattern is matched against the "
+                "(fp8/mxfp4/convrot_int8, or MAGI-2 w8a8). Each pattern is matched against the "
                 "layer prefix. "
                 "Example: --quantization-ignored-layers img_mod txt_mod to_out"
             ),

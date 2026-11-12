@@ -19,9 +19,26 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
 from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
     ModelDeploymentConfig,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+
+def magi2_w8a8_options(
+    server_args, component_name: str
+) -> tuple[bool, tuple[str, ...]]:
+    method = server_args.component_quantizations.get(
+        component_name, server_args.quantization
+    )
+    if method is None:
+        return False, ()
+    if method not in ("w8a8", "w8a8_int"):
+        raise ValueError(f"MAGI-2 supports only NPU w8a8 quantization; got {method!r}")
+    ignored = server_args.component_quantization_ignored_layers.get(
+        component_name, server_args.quantization_ignored_layers
+    )
+    return True, tuple(ignored or ())
 
 
 @dataclass
@@ -113,12 +130,7 @@ class Magi2PipelineConfig(PipelineConfig):
         super().validate_server_args(server_args)
         self._warn_about_allocator()
 
-        if server_args.quantization or server_args.component_quantizations:
-            raise ValueError(
-                "MAGI-2's native loader does not implement quantization; "
-                "quantization flags would leave its weights unquantized. "
-                "Use checkpoint precision with offload and expert parallelism."
-            )
+        self._validate_quantization(server_args)
 
         if server_args.enable_cfg_parallel:
             raise ValueError(
@@ -189,6 +201,27 @@ class Magi2PipelineConfig(PipelineConfig):
                     f"MAGI-2 shards {name} ({count}) across ranks; num_gpus "
                     f"({num_gpus}) must divide it. Valid counts are "
                     f"{[n for n in range(1, max(axes.values()) + 1) if all(c % n == 0 for c in axes.values())]}"
+                )
+
+    def _validate_quantization(self, server_args) -> None:
+        unsupported = set(server_args.component_quantizations) - {
+            "transformer",
+            "transformer_2",
+        }
+        if unsupported:
+            raise ValueError(
+                f"MAGI-2 W8A8 only supports DiT components; got {sorted(unsupported)}"
+            )
+        selected = [
+            magi2_w8a8_options(server_args, name)[0]
+            for name in ("transformer", "transformer_2")
+        ]
+        if any(selected):
+            if not current_platform.is_npu():
+                raise ValueError("MAGI-2 W8A8 requires Ascend NPU")
+            if server_args.use_fsdp_inference:
+                raise ValueError(
+                    "MAGI-2 W8A8 supports expert parallelism and offload, not FSDP"
                 )
 
 
